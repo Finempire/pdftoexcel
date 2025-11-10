@@ -1,4 +1,15 @@
 # app.py
+"""
+Streamlit app: Bank statement PDF -> Excel
+Text-extraction first (pdfplumber). If not enough extracted text, uses OCR fallback.
+This version uses Pillow-only preprocessing (no OpenCV) so it works on Python versions
+without opencv-python wheels.
+System deps required:
+ - Poppler (for pdf2image)
+ - Tesseract OCR (for pytesseract)
+Python packages:
+ pip install streamlit pdfplumber pdf2image pytesseract pillow pandas openpyxl
+"""
 import io
 import re
 from typing import List, Dict, Optional
@@ -8,13 +19,11 @@ import streamlit as st
 import pandas as pd
 import pdfplumber
 from pdf2image import convert_from_bytes
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import pytesseract
-import cv2
-import numpy as np
 
-st.set_page_config(page_title="Bank PDF → Excel (with OCR fallback)", layout="wide")
-st.title("Bank PDF → Excel — text + OCR parser")
+st.set_page_config(page_title="Bank PDF → Excel (Pillow OCR)", layout="wide")
+st.title("Bank PDF → Excel — text + OCR parser (Pillow only)")
 st.write("Upload a bank statement PDF (digital or scanned). The app will try text extraction first, then OCR if needed.")
 
 uploaded = st.file_uploader("Upload bank statement PDF", type=["pdf"])
@@ -32,7 +41,7 @@ AMOUNT_PLAIN_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))')
 
 def text_from_pdf_bytes(pdf_bytes: bytes) -> List[str]:
     """Extract text lines using pdfplumber. Returns list of non-empty lines."""
-    lines = []
+    lines: List[str] = []
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
@@ -45,55 +54,78 @@ def text_from_pdf_bytes(pdf_bytes: bytes) -> List[str]:
         st.sidebar.error(f"pdfplumber error: {e}")
     return lines
 
-# ---------- OCR helpers ----------
-def preprocess_image_for_ocr(pil_img: Image.Image) -> Image.Image:
-    """Basic preprocessing: grayscale, bilateral filter, adaptive thresholding, and optional deskew."""
-    # Convert to OpenCV image
-    img = np.array(pil_img.convert('RGB'))
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+# ---------- Pillow-only OCR preprocessing ----------
+def preprocess_image_for_ocr(pil_img: Image.Image, sharpen: bool = True, contrast: float = 1.5, threshold: int = 160) -> Image.Image:
+    """
+    Simple Pillow-based preprocessing pipeline:
+      - convert to grayscale
+      - enhance contrast
+      - optional sharpen
+      - autocontrast
+      - threshold -> binary image which often improves Tesseract on noisy scans
+    Returns grayscale PIL Image.
+    """
+    # Convert to grayscale
+    im = pil_img.convert("L")
 
-    # Denoise (bilateral preserves edges)
-    denoised = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    # Slightly upscale small images to improve OCR (if small)
+    if im.size[0] < 1000:
+        im = im.resize((int(im.size[0] * 1.5), int(im.size[1] * 1.5)), Image.BILINEAR)
 
-    # Adaptive threshold (works well for uneven lighting)
-    th = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY, 31, 15)
+    # Enhance contrast
+    try:
+        enhancer = ImageEnhance.Contrast(im)
+        im = enhancer.enhance(contrast)
+    except Exception:
+        pass
 
-    # Optional morphological opening to remove small noise
-    kernel = np.ones((1, 1), np.uint8)
-    opened = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel)
+    # Optional sharpen
+    if sharpen:
+        im = im.filter(ImageFilter.SHARPEN)
 
-    # Convert back to PIL
-    proc = Image.fromarray(opened)
-    return proc
+    # Autocontrast (stretch)
+    im = ImageOps.autocontrast(im, cutoff=1)
 
-def ocr_pdf_bytes(pdf_bytes: bytes, dpi: int = 300, max_pages: Optional[int]=None) -> List[str]:
-    """Convert PDF pages to images and OCR each page, returning lines."""
-    lines = []
+    # Apply simple thresholding to get binary-like image (helps OCR in many cases)
+    im = im.point(lambda x: 0 if x < threshold else 255, mode='1')
+
+    # Convert back to L for tesseract (it accepts both)
+    im = im.convert("L")
+    return im
+
+def ocr_pdf_bytes(pdf_bytes: bytes, dpi: int = 300, max_pages: Optional[int] = None) -> List[str]:
+    """Convert PDF pages to images and OCR each page, returning non-empty lines."""
+    lines: List[str] = []
     try:
         images = convert_from_bytes(pdf_bytes, dpi=dpi)
     except Exception as e:
-        st.error(f"pdf2image error: {e}")
+        st.error(f"pdf2image error (poppler missing or unreadable PDF): {e}")
         return lines
 
     if max_pages:
         images = images[:max_pages]
 
     for i, img in enumerate(images):
-        # Simple preview of first page in sidebar
         if i == 0:
-            st.sidebar.image(img.resize((300, int(300 * img.height / img.width))), caption="Page 1 preview (for OCR)")
+            # preview small thumbnail
+            try:
+                st.sidebar.image(img.resize((300, int(300 * img.height / img.width))), caption="Page 1 preview (OCR)")
+            except Exception:
+                pass
 
-        proc = preprocess_image_for_ocr(img)
+        proc = preprocess_image_for_ocr(img, sharpen=True, contrast=1.5, threshold=150)
         # Use Tesseract to get text
-        txt = pytesseract.image_to_string(proc, lang='eng')
-        # split into non-empty lines
+        try:
+            txt = pytesseract.image_to_string(proc, lang='eng')
+        except Exception as e:
+            st.sidebar.error(f"Tesseract OCR error: {e}")
+            txt = ""
         page_lines = [l.strip() for l in txt.splitlines() if l.strip()]
-        # append with a page delimiter optionally
         lines.extend(page_lines)
     return lines
 
 def group_lines_into_records(lines: List[str]) -> List[str]:
+    """Combine wrapped narration lines into single transaction records based on date-start heuristic."""
     records: List[str] = []
     for ln in lines:
         if DATE_LINE_RE.match(ln):
@@ -106,6 +138,7 @@ def group_lines_into_records(lines: List[str]) -> List[str]:
     return records
 
 def parse_record(rec: str) -> Optional[Dict[str, str]]:
+    """Parse a single combined record string into Date, Narration, Debit, Credit, Balance."""
     m = DATE_LINE_RE.match(rec)
     if not m:
         return None
@@ -146,18 +179,20 @@ def parse_records(records: List[str]) -> pd.DataFrame:
     df = df.fillna("").astype(str)
     return df
 
-# ---------- Main flow: try text extraction -> OCR fallback ----------
-st.info("Attempting text-extraction (fast). If nothing found, will run OCR (slower).")
+# ---------- Main flow ----------
+st.info("Attempting text-extraction (fast). If not enough text is found, OCR will be used (slower).")
 lines = text_from_pdf_bytes(pdf_bytes)
+
+# heuristics to decide if pdfplumber text is usable
 if len(lines) >= 8:
     st.success(f"pdfplumber extracted {len(lines)} lines; using text extraction.")
-    st.subheader("Sample extracted lines")
+    st.subheader("Sample extracted lines (first 30):")
     st.write(lines[:30])
     used_method = "text"
 else:
     st.warning("pdfplumber found little or no text — running OCR fallback (this may take longer).")
     ocr_lines = ocr_pdf_bytes(pdf_bytes, dpi=300, max_pages=None)
-    st.subheader("Sample OCR lines (first 80)")
+    st.subheader("Sample OCR lines (first 80):")
     st.write(ocr_lines[:80])
     lines = ocr_lines
     used_method = "ocr"
@@ -175,11 +210,10 @@ st.success(f"Parsed {len(df)} transactions using method: {used_method.upper()}."
 st.subheader("Parsed Data (editable)")
 edited = st.experimental_data_editor(df, num_rows="dynamic")
 
-# Convert numeric columns if possible (optional: user can toggle)
+# Optionally convert amounts to numeric
 def try_convert_amounts(dff: pd.DataFrame) -> pd.DataFrame:
     for col in ["Debit", "Credit", "Balance"]:
         if col in dff.columns:
-            # strip commas/spaces then try to convert; leave blank as NaN
             dff[col] = dff[col].replace(r'^\s*$', None, regex=True)
             dff[col] = dff[col].str.replace(',', '').str.replace(' ', '')
             dff[col] = pd.to_numeric(dff[col], errors='coerce')
@@ -204,8 +238,8 @@ st.download_button("Download parsed data as Excel", data=to_excel_bytes(edited_c
 st.markdown("#### Notes / tips")
 st.markdown(
     """
-- OCR fallback uses preprocessing (grayscale → denoise → adaptive threshold). If OCR errors occur, try different DPI or improve lighting/scan quality.
-- If your bank uses a consistent layout, I can tune column-splitting by x-coordinates for higher accuracy.
-- For large batches or sensitive data, consider running locally (this app works fully on your machine).
+- This version avoids OpenCV and uses Pillow-only preprocessing so it runs on systems where opencv-python wheels are not available.
+- OCR quality depends on scan resolution and clarity. If OCR errors appear, try increasing DPI or improving the scan.
+- If statements come from a consistent bank/layout, I can add a bank-specific parser (higher accuracy).
 """
 )
