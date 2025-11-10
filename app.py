@@ -1,19 +1,25 @@
 # app.py
 """
-Streamlit app: Bank statement PDF -> Excel
-Text-extraction first (pdfplumber). If not enough extracted text, uses OCR fallback.
-This version uses Pillow-only preprocessing (no OpenCV) so it works on Python versions
-without opencv-python wheels.
-System deps required:
+Streamlit bank-statement parser (text + OCR fallback)
+- Uses pdfplumber for text PDFs
+- Falls back to OCR (pytesseract) with preprocessing
+- If opencv-python (cv2) is installed it uses a stronger cv2-based preprocessing (deskew + denoise)
+- If cv2 not installed, falls back to Pillow-only preprocessing so it works on Python versions without OpenCV wheels.
+
+System deps:
  - Poppler (for pdf2image)
  - Tesseract OCR (for pytesseract)
+
 Python packages:
  pip install streamlit pdfplumber pdf2image pytesseract pillow pandas openpyxl
+ Optional: pip install opencv-python
 """
+
 import io
 import re
 from typing import List, Dict, Optional
 import tempfile
+import math
 
 import streamlit as st
 import pandas as pd
@@ -22,9 +28,17 @@ from pdf2image import convert_from_bytes
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import pytesseract
 
-st.set_page_config(page_title="Bank PDF → Excel (Pillow OCR)", layout="wide")
-st.title("Bank PDF → Excel — text + OCR parser (Pillow only)")
-st.write("Upload a bank statement PDF (digital or scanned). The app will try text extraction first, then OCR if needed.")
+# Try to import OpenCV. If available, use it for better preprocessing.
+try:
+    import cv2
+    HAS_CV2 = True
+except Exception:
+    cv2 = None
+    HAS_CV2 = False
+
+st.set_page_config(page_title="Bank PDF → Excel (auto OpenCV/Pillow)", layout="wide")
+st.title("Bank PDF → Excel — text + OCR parser (auto OpenCV / Pillow)")
+st.write("Uploads: text-based PDFs are parsed fast. Scanned PDFs use OCR fallback. If OpenCV is installed, a stronger preprocessing pipeline is used.")
 
 uploaded = st.file_uploader("Upload bank statement PDF", type=["pdf"])
 if not uploaded:
@@ -33,6 +47,7 @@ if not uploaded:
 
 pdf_bytes = uploaded.read()
 st.sidebar.markdown(f"**Filename:** {uploaded.name} — {len(pdf_bytes)//1024} KB")
+st.sidebar.markdown(f"**OpenCV available:** {'Yes' if HAS_CV2 else 'No'}")
 
 # ---------- Regexes & helpers ----------
 DATE_LINE_RE = re.compile(r'^\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s[A-Za-z]{3}\s\d{4})\s+')
@@ -54,47 +69,114 @@ def text_from_pdf_bytes(pdf_bytes: bytes) -> List[str]:
         st.sidebar.error(f"pdfplumber error: {e}")
     return lines
 
-# ---------- Pillow-only OCR preprocessing ----------
-def preprocess_image_for_ocr(pil_img: Image.Image, sharpen: bool = True, contrast: float = 1.5, threshold: int = 160) -> Image.Image:
+# ---------- Image preprocessing (cv2 if available, else Pillow) ----------
+def preprocess_with_cv2(pil_img: Image.Image, target_width=2000) -> Image.Image:
     """
-    Simple Pillow-based preprocessing pipeline:
-      - convert to grayscale
-      - enhance contrast
-      - optional sharpen
-      - autocontrast
-      - threshold -> binary image which often improves Tesseract on noisy scans
-    Returns grayscale PIL Image.
+    OpenCV preprocessing pipeline:
+     - convert to grayscale
+     - optionally resize to target_width (maintain aspect)
+     - bilateral filter (denoise)
+     - adaptive threshold
+     - deskew using largest contour / angle estimate
+    Returns a PIL Image (grayscale).
     """
-    # Convert to grayscale
-    im = pil_img.convert("L")
+    img = pil_img.convert("RGB")
+    arr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)  # cv2 uses BGR
+    gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
 
-    # Slightly upscale small images to improve OCR (if small)
+    # Resize if small / scale to target_width
+    h, w = gray.shape[:2]
+    if w < target_width:
+        scale = target_width / float(w)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    # Denoise (bilateral preserves edges)
+    den = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+
+    # Morphological opening to remove small noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1,1))
+    opened = cv2.morphologyEx(den, cv2.MORPH_OPEN, kernel)
+
+    # Adaptive threshold
+    th = cv2.adaptiveThreshold(opened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 35, 15)
+
+    # Deskew: compute angle from largest non-background contour using Hough or minAreaRect on edges
+    try:
+        coords = np.column_stack(np.where(th < 255))
+        angle = 0.0
+        if coords.shape[0] > 0:
+            rect = cv2.minAreaRect(coords)
+            angle = rect[-1]
+            if angle < -45:
+                angle = -(90 + angle)
+            else:
+                angle = -angle
+            # rotate image to correct angle
+            (h2, w2) = th.shape[:2]
+            center = (w2 // 2, h2 // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            rotated = cv2.warpAffine(th, M, (w2, h2), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            th = rotated
+    except Exception:
+        pass
+
+    # Convert back to PIL
+    pil_out = Image.fromarray(th).convert("L")
+    return pil_out
+
+def preprocess_with_pillow(pil_img: Image.Image, sharpen: bool=True, contrast: float=1.6, threshold: int=150) -> Image.Image:
+    """
+    Pillow-only preprocessing pipeline:
+      - grayscale
+      - upscale modestly if small
+      - contrast enhancement
+      - sharpen
+      - autocontrast
+      - threshold -> binary image
+    """
+    im = pil_img.convert("L")
+    # upscale small images
     if im.size[0] < 1000:
         im = im.resize((int(im.size[0] * 1.5), int(im.size[1] * 1.5)), Image.BILINEAR)
 
-    # Enhance contrast
     try:
         enhancer = ImageEnhance.Contrast(im)
         im = enhancer.enhance(contrast)
     except Exception:
         pass
 
-    # Optional sharpen
     if sharpen:
         im = im.filter(ImageFilter.SHARPEN)
 
-    # Autocontrast (stretch)
     im = ImageOps.autocontrast(im, cutoff=1)
-
-    # Apply simple thresholding to get binary-like image (helps OCR in many cases)
     im = im.point(lambda x: 0 if x < threshold else 255, mode='1')
-
-    # Convert back to L for tesseract (it accepts both)
     im = im.convert("L")
     return im
 
-def ocr_pdf_bytes(pdf_bytes: bytes, dpi: int = 300, max_pages: Optional[int] = None) -> List[str]:
-    """Convert PDF pages to images and OCR each page, returning non-empty lines."""
+# Lazy import of numpy only if cv2 available (to avoid unnecessary dependency)
+if HAS_CV2:
+    import numpy as np
+else:
+    # but some helper functions below may still want a local np; create a limited numpy-like shim for shapes if needed
+    import numpy as np  # pillow fallback still uses numpy for convert_from_bytes internal; numpy is normally available
+
+def preprocess_image_for_ocr(pil_img: Image.Image) -> Image.Image:
+    # If cv2 available, use that pipeline
+    if HAS_CV2:
+        try:
+            return preprocess_with_cv2(pil_img, target_width=2000)
+        except Exception:
+            # fallback to pillow
+            return preprocess_with_pillow(pil_img, sharpen=True, contrast=1.6, threshold=150)
+    else:
+        return preprocess_with_pillow(pil_img, sharpen=True, contrast=1.6, threshold=150)
+
+# ---------- OCR flow ----------
+def ocr_pdf_bytes(pdf_bytes: bytes, dpi: int = 350, max_pages: Optional[int] = None) -> List[str]:
+    """Convert PDF -> images and run OCR with preprocessing. Returns list of non-empty lines."""
     lines: List[str] = []
     try:
         images = convert_from_bytes(pdf_bytes, dpi=dpi)
@@ -107,16 +189,16 @@ def ocr_pdf_bytes(pdf_bytes: bytes, dpi: int = 300, max_pages: Optional[int] = N
 
     for i, img in enumerate(images):
         if i == 0:
-            # preview small thumbnail
             try:
                 st.sidebar.image(img.resize((300, int(300 * img.height / img.width))), caption="Page 1 preview (OCR)")
             except Exception:
                 pass
 
-        proc = preprocess_image_for_ocr(img, sharpen=True, contrast=1.5, threshold=150)
-        # Use Tesseract to get text
+        proc = preprocess_image_for_ocr(img)
+        # Tesseract config can be tuned; using page segmentation mode 6 (assume a single uniform block of text)
+        tesseract_config = "--psm 6"
         try:
-            txt = pytesseract.image_to_string(proc, lang='eng')
+            txt = pytesseract.image_to_string(proc, lang='eng', config=tesseract_config)
         except Exception as e:
             st.sidebar.error(f"Tesseract OCR error: {e}")
             txt = ""
@@ -124,6 +206,7 @@ def ocr_pdf_bytes(pdf_bytes: bytes, dpi: int = 300, max_pages: Optional[int] = N
         lines.extend(page_lines)
     return lines
 
+# ---------- Grouping & parsing ----------
 def group_lines_into_records(lines: List[str]) -> List[str]:
     """Combine wrapped narration lines into single transaction records based on date-start heuristic."""
     records: List[str] = []
@@ -180,10 +263,10 @@ def parse_records(records: List[str]) -> pd.DataFrame:
     return df
 
 # ---------- Main flow ----------
-st.info("Attempting text-extraction (fast). If not enough text is found, OCR will be used (slower).")
+st.info("Attempting text-extraction first (fast). If insufficient, OCR fallback will run (slower).")
 lines = text_from_pdf_bytes(pdf_bytes)
 
-# heuristics to decide if pdfplumber text is usable
+# Heuristic: if few lines found, do OCR. Use len >= 8 as earlier heuristic.
 if len(lines) >= 8:
     st.success(f"pdfplumber extracted {len(lines)} lines; using text extraction.")
     st.subheader("Sample extracted lines (first 30):")
@@ -191,7 +274,8 @@ if len(lines) >= 8:
     used_method = "text"
 else:
     st.warning("pdfplumber found little or no text — running OCR fallback (this may take longer).")
-    ocr_lines = ocr_pdf_bytes(pdf_bytes, dpi=300, max_pages=None)
+    # Using a slightly higher DPI tuned for bank statements
+    ocr_lines = ocr_pdf_bytes(pdf_bytes, dpi=400, max_pages=None)
     st.subheader("Sample OCR lines (first 80):")
     st.write(ocr_lines[:80])
     lines = ocr_lines
@@ -203,7 +287,7 @@ st.write(records[:40])
 
 df = parse_records(records)
 if df.empty:
-    st.error("No transactions parsed. If your PDF is scanned and still fails, try increasing DPI, or upload a sample page for me to tune preprocessing.")
+    st.error("No transactions parsed. If your PDF is scanned and still fails, try increasing DPI or upload a sample page for me to tune preprocessing.")
     st.stop()
 
 st.success(f"Parsed {len(df)} transactions using method: {used_method.upper()}.")
@@ -215,7 +299,7 @@ def try_convert_amounts(dff: pd.DataFrame) -> pd.DataFrame:
     for col in ["Debit", "Credit", "Balance"]:
         if col in dff.columns:
             dff[col] = dff[col].replace(r'^\s*$', None, regex=True)
-            dff[col] = dff[col].str.replace(',', '').str.replace(' ', '')
+            dff[col] = dff[col].str.replace(',', '', regex=False).str.replace(' ', '', regex=False)
             dff[col] = pd.to_numeric(dff[col], errors='coerce')
     return dff
 
@@ -235,11 +319,12 @@ st.download_button("Download parsed data as Excel", data=to_excel_bytes(edited_c
                    file_name=uploaded.name.replace(".pdf", ".xlsx"),
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.markdown("#### Notes / tips")
+st.markdown("#### Notes & tips")
 st.markdown(
     """
-- This version avoids OpenCV and uses Pillow-only preprocessing so it runs on systems where opencv-python wheels are not available.
-- OCR quality depends on scan resolution and clarity. If OCR errors appear, try increasing DPI or improving the scan.
-- If statements come from a consistent bank/layout, I can add a bank-specific parser (higher accuracy).
+- If OpenCV (cv2) is installed, the app uses a stronger preprocessing pipeline (deskew + denoise + adaptive threshold). This usually improves OCR accuracy significantly.
+- If you run into errors installing opencv-python on Python 3.13, create a venv using Python 3.11 or 3.12 and `pip install opencv-python`.
+- For your Kotak PDF (text-based), the text-extraction path is used (fast & accurate). OCR fallback is only used for scanned images.
+- If you want I can further tune the thresholds (contrast/threshold) specifically for your uploaded Kotak sample — tell me if you see OCR mistakes and paste sample lines that are wrong.
 """
 )
