@@ -164,6 +164,8 @@ elif bank_name == "HDFC Bank":
     DATE_LINE_RE = re.compile(r'^\s*(\d{1,2}/\d{1,2}/\d{2,4})\s+')
     AMOUNT_RE = re.compile(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2}))')
     VALUE_DT_RE = re.compile(r'\s(\d{1,2}/\d{1,2}/\d{2,4})\s*$')
+    # HDFC के लिए withdrawal और deposit amounts को अलग-अलग पहचानने के लिए
+    WITHDRAWAL_RE = re.compile(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2}))\s+(?:\d{1,3}(?:,\d{3})*(?:\.\d{2}))\s+(\d{1,3}(?:,\d{3})*(?:\.\d{2}))')
 
     def parse_record(rec: str) -> Optional[Dict[str, str]]:
         m = DATE_LINE_RE.match(rec)
@@ -175,7 +177,7 @@ elif bank_name == "HDFC Bank":
         # Remove trailing 'value date' if present
         rest = VALUE_DT_RE.sub('', rest).strip()
 
-        # Find amounts
+        # Find all amounts
         amounts = AMOUNT_RE.findall(rest)
         amounts_norm = [a.replace(',', '') for a in amounts]
 
@@ -190,13 +192,27 @@ elif bank_name == "HDFC Bank":
         credit = ""
         balance = ""
 
+        # HDFC statement format: Date | Narration | Withdrawal | Deposit | Balance
         if len(amounts_norm) >= 3:
-            debit = amounts_norm[0]
-            credit = amounts_norm[1]
-            balance = amounts_norm[-1]
+            # Typically: Withdrawal, Deposit, Balance
+            debit = amounts_norm[0] if amounts_norm[0] != '' else ""
+            credit = amounts_norm[1] if amounts_norm[1] != '' else ""
+            balance = amounts_norm[2] if len(amounts_norm) > 2 else ""
         elif len(amounts_norm) == 2:
-            debit = amounts_norm[0]
-            balance = amounts_norm[1]
+            # Check if it's withdrawal + balance or deposit + balance
+            # For HDFC, usually first is withdrawal, second is balance (if credit is empty)
+            # Or first is deposit, second is balance (if debit is empty)
+            # We'll check the context
+            if 'withdrawal' in rest.lower() or 'w/d' in rest.lower():
+                debit = amounts_norm[0]
+                balance = amounts_norm[1]
+            elif 'deposit' in rest.lower() or 'dep' in rest.lower():
+                credit = amounts_norm[0]
+                balance = amounts_norm[1]
+            else:
+                # Assume first is transaction amount, second is balance
+                # Leave both debit and credit blank for manual correction
+                balance = amounts_norm[1]
         elif len(amounts_norm) == 1:
             balance = amounts_norm[0]
 
