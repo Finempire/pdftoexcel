@@ -3,6 +3,6 @@ pdfplumber
 pdf2image
 pytesseract
 pillow
-opencv-python
+opencv
 pandas
 openpyxl
