@@ -158,6 +158,39 @@ def parse_records(records: List[str]) -> pd.DataFrame:
     df = df.fillna("").astype(str)
     return df
 
+def fix_check_reference_issues(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fix issues where check reference numbers are incorrectly captured in debit/credit columns.
+    Moves numeric values from Debit/Credit to Narration when they appear to be check references.
+    """
+    df_fixed = df.copy()
+    
+    for idx, row in df_fixed.iterrows():
+        narration = str(row["Narration"])
+        debit = str(row["Debit"])
+        credit = str(row["Credit"])
+        
+        # Check if debit/credit contains what looks like a check reference
+        # Check references are typically 6+ digits without decimal points
+        if debit and debit.isdigit() and len(debit) >= 6:
+            # Move check reference from debit to narration
+            df_fixed.at[idx, "Narration"] = f"{narration} CHQ REF {debit}".strip()
+            df_fixed.at[idx, "Debit"] = ""
+        
+        if credit and credit.isdigit() and len(credit) >= 6:
+            # Move check reference from credit to narration
+            df_fixed.at[idx, "Narration"] = f"{narration} CHQ REF {credit}".strip()
+            df_fixed.at[idx, "Credit"] = ""
+            
+        # Also check for numeric values that might be check references in balance
+        balance = str(row["Balance"])
+        if balance and balance.isdigit() and len(balance) >= 6 and ("CHQ" in narration.upper() or "CHEQUE" in narration.upper()):
+            # This might be a check number in balance column
+            df_fixed.at[idx, "Narration"] = f"{narration} CHQ REF {balance}".strip()
+            df_fixed.at[idx, "Balance"] = ""
+    
+    return df_fixed
+
 # ---------- Main flow ----------
 st.info("Trying fast text extraction (pdfplumber). If insufficient results, OCR will be used.")
 
@@ -191,14 +224,34 @@ if df.empty:
     st.error("No transactions parsed. If this PDF is scanned and still fails, try increasing DPI or upload a sample page for me to tune preprocessing.")
     st.stop()
 
-# Show parsed dataframe preview
-st.subheader("Parsed table preview")
-st.dataframe(df.head(200))  # show up to 200 rows in preview
+# Apply check reference fixes
+st.subheader("Fixing check reference issues...")
+df_fixed = fix_check_reference_issues(df)
+
+# Show comparison of before and after
+col1, col2 = st.columns(2)
+with col1:
+    st.subheader("Before fixing check references")
+    st.dataframe(df.head(50))
+
+with col2:
+    st.subheader("After fixing check references")
+    st.dataframe(df_fixed.head(50))
+
+# Show summary of changes
+changes_mask = (df["Debit"] != df_fixed["Debit"]) | (df["Credit"] != df_fixed["Credit"]) | (df["Narration"] != df_fixed["Narration"])
+if changes_mask.any():
+    st.success(f"Fixed {changes_mask.sum()} records with potential check reference issues")
+    changed_records = df_fixed[changes_mask]
+    st.subheader("Changed records:")
+    st.dataframe(changed_records)
+else:
+    st.info("No check reference issues detected")
 
 # Convert amounts option
 convert_flag = st.checkbox("Convert Debit/Credit/Balance to numeric (strip commas and convert)", value=True)
 if convert_flag:
-    df_conv = df.copy()
+    df_conv = df_fixed.copy()
     for col in ["Debit", "Credit", "Balance"]:
         if col in df_conv.columns:
             df_conv[col] = df_conv[col].replace(r'^\s*$', None, regex=True)
@@ -219,7 +272,7 @@ if convert_flag:
         totals["Last balance (numeric)"] = last_balance
     st.write(totals)
 else:
-    df_conv = df.copy()
+    df_conv = df_fixed.copy()
 
 # Download buttons: CSV and Excel
 def to_excel_bytes(dff: pd.DataFrame) -> bytes:
