@@ -1,210 +1,211 @@
+# app.py
 import io
 import re
-from typing import List, Dict, Optional, Callable
+from typing import List, Dict, Optional
+import tempfile
 
 import streamlit as st
 import pandas as pd
 import pdfplumber
+from pdf2image import convert_from_bytes
+from PIL import Image, ImageOps, ImageFilter
+import pytesseract
+import cv2
+import numpy as np
 
-st.set_page_config(page_title="Bank Statement Parser", layout="wide")
-st.title("Bank Statement PDF → Excel Parser")
+st.set_page_config(page_title="Bank PDF → Excel (with OCR fallback)", layout="wide")
+st.title("Bank PDF → Excel — text + OCR parser")
+st.write("Upload a bank statement PDF (digital or scanned). The app will try text extraction first, then OCR if needed.")
 
-# --- 1. SHARED HELPERS & REGEX -----------------------------------------------
-COMMON_DATE_RE = re.compile(r'^\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\s+')
-# Regex for amounts specifically with (Dr) or (Cr) tags
-AMOUNT_WITH_TAG_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))\s*\(\s*(Dr|Cr)\s*\)', re.IGNORECASE)
-# Regex for plain amounts (must have a decimal point to avoid capturing long ref numbers)
-PLAIN_AMOUNT_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))')
+uploaded = st.file_uploader("Upload bank statement PDF", type=["pdf"])
+if not uploaded:
+    st.info("Upload a PDF to begin.")
+    st.stop()
 
-@st.cache_data(show_spinner=False)
-def extract_text_from_pdf(file_bytes: bytes) -> List[str]:
-    """Generic: Extract text lines from generic PDF."""
-    lines: List[str] = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            # Increased tolerance to better capture text in table cells
-            text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
-            for ln in text.splitlines():
-                ln = ln.rstrip()
-                if ln:
-                    lines.append(ln)
+pdf_bytes = uploaded.read()
+st.sidebar.markdown(f"**Filename:** {uploaded.name} — {len(pdf_bytes)//1024} KB")
+
+# ---------- Regexes & helpers ----------
+DATE_LINE_RE = re.compile(r'^\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s[A-Za-z]{3}\s\d{4})\s+')
+AMOUNT_TAG_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))\s*\(?\s*(Dr|Cr)\s*\)?', re.IGNORECASE)
+AMOUNT_PLAIN_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))')
+
+def text_from_pdf_bytes(pdf_bytes: bytes) -> List[str]:
+    """Extract text lines using pdfplumber. Returns list of non-empty lines."""
+    lines = []
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                for ln in text.splitlines():
+                    ln = ln.rstrip()
+                    if ln:
+                        lines.append(ln)
+    except Exception as e:
+        st.sidebar.error(f"pdfplumber error: {e}")
     return lines
 
+# ---------- OCR helpers ----------
+def preprocess_image_for_ocr(pil_img: Image.Image) -> Image.Image:
+    """Basic preprocessing: grayscale, bilateral filter, adaptive thresholding, and optional deskew."""
+    # Convert to OpenCV image
+    img = np.array(pil_img.convert('RGB'))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    # Denoise (bilateral preserves edges)
+    denoised = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+
+    # Adaptive threshold (works well for uneven lighting)
+    th = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 31, 15)
+
+    # Optional morphological opening to remove small noise
+    kernel = np.ones((1, 1), np.uint8)
+    opened = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel)
+
+    # Convert back to PIL
+    proc = Image.fromarray(opened)
+    return proc
+
+def ocr_pdf_bytes(pdf_bytes: bytes, dpi: int = 300, max_pages: Optional[int]=None) -> List[str]:
+    """Convert PDF pages to images and OCR each page, returning lines."""
+    lines = []
+    try:
+        images = convert_from_bytes(pdf_bytes, dpi=dpi)
+    except Exception as e:
+        st.error(f"pdf2image error: {e}")
+        return lines
+
+    if max_pages:
+        images = images[:max_pages]
+
+    for i, img in enumerate(images):
+        # Simple preview of first page in sidebar
+        if i == 0:
+            st.sidebar.image(img.resize((300, int(300 * img.height / img.width))), caption="Page 1 preview (for OCR)")
+
+        proc = preprocess_image_for_ocr(img)
+        # Use Tesseract to get text
+        txt = pytesseract.image_to_string(proc, lang='eng')
+        # split into non-empty lines
+        page_lines = [l.strip() for l in txt.splitlines() if l.strip()]
+        # append with a page delimiter optionally
+        lines.extend(page_lines)
+    return lines
+
+def group_lines_into_records(lines: List[str]) -> List[str]:
+    records: List[str] = []
+    for ln in lines:
+        if DATE_LINE_RE.match(ln):
+            records.append(ln.strip())
+        else:
+            if records:
+                records[-1] = records[-1] + " " + ln.strip()
+            else:
+                records.append(ln.strip())
+    return records
+
+def parse_record(rec: str) -> Optional[Dict[str, str]]:
+    m = DATE_LINE_RE.match(rec)
+    if not m:
+        return None
+    date = m.group(1).strip()
+    rest = rec[m.end():].strip()
+
+    amount_tags = AMOUNT_TAG_RE.findall(rest)
+    if not amount_tags:
+        plain_amounts = AMOUNT_PLAIN_RE.findall(rest)
+        if len(plain_amounts) >= 2:
+            txn_amt = plain_amounts[-2].replace(' ', '').replace(',', '')
+            bal_amt = plain_amounts[-1].replace(' ', '').replace(',', '')
+            narration = AMOUNT_PLAIN_RE.sub('', rest).strip()
+            return {"Date": date, "Narration": narration, "Debit": txn_amt, "Credit": "", "Balance": bal_amt}
+        else:
+            narration = rest
+            return {"Date": date, "Narration": narration, "Debit": "", "Credit": "", "Balance": ""}
+
+    normalized = [(a.replace(' ', '').replace(',', ''), t.lower()) for a, t in amount_tags]
+    txn_amt, txn_tag = normalized[0]
+    if len(normalized) >= 2:
+        bal_amt, bal_tag = normalized[-1]
+    else:
+        bal_amt = ""
+    debit = txn_amt if txn_tag == 'dr' else ""
+    credit = txn_amt if txn_tag == 'cr' else ""
+    narration = AMOUNT_TAG_RE.sub('', rest).strip()
+    narration = narration.strip(' ,;-')
+    return {"Date": date, "Narration": narration, "Debit": debit, "Credit": credit, "Balance": bal_amt}
+
+def parse_records(records: List[str]) -> pd.DataFrame:
+    parsed = []
+    for r in records:
+        p = parse_record(r)
+        if p:
+            parsed.append(p)
+    df = pd.DataFrame(parsed, columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+    df = df.fillna("").astype(str)
+    return df
+
+# ---------- Main flow: try text extraction -> OCR fallback ----------
+st.info("Attempting text-extraction (fast). If nothing found, will run OCR (slower).")
+lines = text_from_pdf_bytes(pdf_bytes)
+if len(lines) >= 8:
+    st.success(f"pdfplumber extracted {len(lines)} lines; using text extraction.")
+    st.subheader("Sample extracted lines")
+    st.write(lines[:30])
+    used_method = "text"
+else:
+    st.warning("pdfplumber found little or no text — running OCR fallback (this may take longer).")
+    ocr_lines = ocr_pdf_bytes(pdf_bytes, dpi=300, max_pages=None)
+    st.subheader("Sample OCR lines (first 80)")
+    st.write(ocr_lines[:80])
+    lines = ocr_lines
+    used_method = "ocr"
+
+records = group_lines_into_records(lines)
+st.subheader(f"Grouped into {len(records)} candidate records (first 40 shown)")
+st.write(records[:40])
+
+df = parse_records(records)
+if df.empty:
+    st.error("No transactions parsed. If your PDF is scanned and still fails, try increasing DPI, or upload a sample page for me to tune preprocessing.")
+    st.stop()
+
+st.success(f"Parsed {len(df)} transactions using method: {used_method.upper()}.")
+st.subheader("Parsed Data (editable)")
+edited = st.experimental_data_editor(df, num_rows="dynamic")
+
+# Convert numeric columns if possible (optional: user can toggle)
+def try_convert_amounts(dff: pd.DataFrame) -> pd.DataFrame:
+    for col in ["Debit", "Credit", "Balance"]:
+        if col in dff.columns:
+            # strip commas/spaces then try to convert; leave blank as NaN
+            dff[col] = dff[col].replace(r'^\s*$', None, regex=True)
+            dff[col] = dff[col].str.replace(',', '').str.replace(' ', '')
+            dff[col] = pd.to_numeric(dff[col], errors='coerce')
+    return dff
+
+if st.checkbox("Convert debit/credit/balance to numeric types (recommended)"):
+    edited_conv = try_convert_amounts(edited.copy())
+else:
+    edited_conv = edited
+
+# Provide Excel download
 def to_excel_bytes(dff: pd.DataFrame) -> bytes:
-    """Generic: Convert DataFrame to Excel bytes."""
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         dff.to_excel(writer, index=False, sheet_name="Statement")
     return out.getvalue()
 
-# --- 2. BANK SPECIFIC PARSERS ------------------------------------------------
+st.download_button("Download parsed data as Excel", data=to_excel_bytes(edited_conv),
+                   file_name=uploaded.name.replace(".pdf", ".xlsx"),
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-def clean_kotak_narration(narration_dirty: str) -> str:
+st.markdown("#### Notes / tips")
+st.markdown(
     """
-    Applies regex rules to clean merged Chq/Ref No from narration string.
-    """
-    narration = narration_dirty
-    
-    # Remove specific reference number patterns observed in Kotak PDFs
-    narration = re.sub(r'UPI/[^/]+/\d{12,}/[^ ]+\s+UPI-\d{12,}', lambda m: m.group(0).split('/')[1] + ' ' + m.group(0).split('/')[3].split()[0], narration)
-    narration = re.sub(r'SentIMPS\d{12,}', '', narration)
-    narration = re.sub(r'IMPS-\d{12,}', '', narration)
-    narration = re.sub(r'TBMS-\d{10,}', '', narration)
-    narration = re.sub(r'UPI-\d{12,}', '', narration)
-    # Remove standalone long digit strings often found as ref numbers
-    narration = re.sub(r'\b\d{10,}\b', '', narration) 
-
-    # General cleanup
-    narration = narration.replace('  ', ' ')
-    return narration.strip(' ,;-')
-
-def parse_kotak(lines: List[str]) -> pd.DataFrame:
-    """
-    Specific parsing logic for Kotak style statements.
-    """
-    records: List[str] = []
-    for ln in lines:
-        if COMMON_DATE_RE.match(ln):
-            records.append(ln.strip())
-        else:
-            if records:
-                records[-1] = records[-1] + " " + ln.strip()
-
-    parsed_data = []
-    for rec in records:
-        m = COMMON_DATE_RE.match(rec)
-        if not m: continue
-        date = m.group(1).strip()
-        rest = rec[m.end():].strip()
-
-        # 1. Try to find explicitly tagged amounts first (Dr/Cr)
-        amount_tags = AMOUNT_WITH_TAG_RE.findall(rest)
-        
-        txn_amt, txn_tag, bal_amt = "", "", ""
-        narration_dirty = rest
-
-        if amount_tags:
-            normalized = [(a.replace(' ', '').replace(',', ''), t.lower()) for a, t in amount_tags]
-            # Assumption: First tagged amount is transaction, last is balance
-            txn_amt, txn_tag = normalized[0]
-            if len(normalized) >= 2:
-                 bal_amt, _ = normalized[-1]
-            
-            # Remove all tagged amounts from narration
-            narration_dirty = AMOUNT_WITH_TAG_RE.sub('', rest)
-
-        else:
-            # 2. Fallback: look for plain amounts if tags are missing
-            plain_amounts = PLAIN_AMOUNT_RE.findall(rest)
-            # Filter out things that look like ref numbers (e.g. no decimal, too long)
-            valid_amounts = [a for a in plain_amounts if '.' in a]
-            
-            if len(valid_amounts) >= 2:
-                txn_amt = valid_amounts[-2].replace(' ', '').replace(',', '')
-                bal_amt = valid_amounts[-1].replace(' ', '').replace(',', '')
-                # Assume it's a debit if unknown, user can fix in UI
-                txn_tag = "dr" 
-                
-                # Remove these specific amounts from narration
-                narration_dirty = rest.replace(valid_amounts[-2], '').replace(valid_amounts[-1], '')
-
-        # Clean up the narration
-        narration = clean_kotak_narration(narration_dirty)
-
-        parsed_data.append({
-            "Date": date,
-            "Narration": narration,
-            "Withdrawal (Dr)": txn_amt if txn_tag == 'dr' else "",
-            "Deposit (Cr)": txn_amt if txn_tag == 'cr' else "",
-            "Balance": bal_amt
-        })
-
-    return pd.DataFrame(parsed_data)
-
-# ... (HDFC and SBI dummy parsers remain the same for now)
-def parse_hdfc_dummy(lines: List[str]) -> pd.DataFrame:
-    return parse_kotak(lines)
-
-def parse_sbi_dummy(lines: List[str]) -> pd.DataFrame:
-    return parse_kotak(lines)
-
-BANK_PARSERS = {
-    "Kotak Bank": parse_kotak,
-    "HDFC Bank (Beta)": parse_hdfc_dummy,
-    "SBI (Beta)": parse_sbi_dummy,
-}
-
-# --- 3. STREAMLIT UI ---------------------------------------------------------
-# ... (UI code remains largely the same, just updated column names in display if needed)
-
-with st.sidebar:
-    st.header("⚙️ Settings")
-    selected_bank_name = st.selectbox("Select Bank Format", list(BANK_PARSERS.keys()))
-    st.divider()
-    st.markdown("**Uploaded Files**")
-
-uploaded_files = st.file_uploader(
-    f"Upload {selected_bank_name} PDF(s)", 
-    type=["pdf"], 
-    accept_multiple_files=True
+- OCR fallback uses preprocessing (grayscale → denoise → adaptive threshold). If OCR errors occur, try different DPI or improve lighting/scan quality.
+- If your bank uses a consistent layout, I can tune column-splitting by x-coordinates for higher accuracy.
+- For large batches or sensitive data, consider running locally (this app works fully on your machine).
+"""
 )
-
-if not uploaded_files:
-    st.info(f"Please upload one or more {selected_bank_name} statements to begin.")
-    st.stop()
-
-if len(uploaded_files) > 1:
-    selected_file = st.selectbox("Select file to preview:", uploaded_files, format_func=lambda x: x.name)
-else:
-    selected_file = uploaded_files[0]
-
-st.sidebar.info(f"Processing: **{selected_file.name}**\n\nFormat: {selected_bank_name}")
-
-st.subheader(f"Preview: {selected_file.name} ({selected_bank_name})")
-
-try:
-    with st.spinner("Extracting text..."):
-        pdf_bytes = selected_file.getvalue()
-        raw_text_lines = extract_text_from_pdf(pdf_bytes)
-
-    with st.spinner(f"Parsing using {selected_bank_name} rules..."):
-        parser_function = BANK_PARSERS[selected_bank_name]
-        df = parser_function(raw_text_lines)
-
-    if df.empty:
-        st.error("No transactions found. Try a different bank format or check the PDF.")
-    else:
-        df_display = df.fillna("").astype(str)
-        
-        # Reorder columns to match your request: Date, Narration, Withdrawal, Deposit, Balance
-        cols_order = ["Date", "Narration", "Withdrawal (Dr)", "Deposit (Cr)", "Balance"]
-        # Ensure all columns exist even if empty
-        for col in cols_order:
-            if col not in df_display.columns:
-                df_display[col] = ""
-        df_display = df_display[cols_order]
-
-        col_preview, col_actions = st.columns([3, 1])
-        with col_preview:
-            edited_df = st.data_editor(
-                df_display,
-                use_container_width=True,
-                num_rows="dynamic",
-                height=600,
-                key=f"editor_{selected_file.name}"
-            )
-            st.caption(f"Showing {len(df)} transactions.")
-
-        with col_actions:
-            st.markdown("### Download")
-            excel_data = to_excel_bytes(edited_df)
-            st.download_button(
-                label="📥 Download Excel",
-                data=excel_data,
-                file_name=f"{selected_bank_name}_{selected_file.name.replace('.pdf', '.xlsx')}",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary"
-            )
-
-except Exception as e:
-    st.error(f"An error occurred: {e}")
