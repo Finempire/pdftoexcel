@@ -39,6 +39,7 @@ st.sidebar.markdown(f"**Filename:** {uploaded.name} — {len(pdf_bytes)//1024} K
 DATE_LINE_RE = re.compile(r'^\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s[A-Za-z]{3}\s\d{4})\s+')
 AMOUNT_TAG_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))\s*\(?\s*(Dr|Cr)\s*\)?', re.IGNORECASE)
 AMOUNT_PLAIN_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))')
+CHEQUE_REF_RE = re.compile(r'(Chq|Cheque|ChqNo|Chq No|Ref|Reference|Ref No|RefNo)\s*[.:]?\s*(\d+)', re.IGNORECASE)
 
 # ---------- extraction helpers ----------
 def text_from_pdf_bytes(pdf_bytes: bytes) -> List[str]:
@@ -125,17 +126,33 @@ def parse_record(rec: str) -> Optional[Dict[str, str]]:
         return None
     date = m.group(1).strip()
     rest = rec[m.end():].strip()
-    amount_tags = AMOUNT_TAG_RE.findall(rest)
+    
+    # चेक रेफरेंस को अलग करें और narration से हटाएं
+    cheque_refs = []
+    def remove_cheque_ref(match):
+        cheque_refs.append(match.group(2))  # सिर्फ नंबर लें
+        return ""
+    
+    # पहले चेक रेफरेंस को हटाएं
+    rest_clean = CHEQUE_REF_RE.sub(remove_cheque_ref, rest)
+    
+    amount_tags = AMOUNT_TAG_RE.findall(rest_clean)
     if not amount_tags:
-        plain_amounts = AMOUNT_PLAIN_RE.findall(rest)
+        plain_amounts = AMOUNT_PLAIN_RE.findall(rest_clean)
         if len(plain_amounts) >= 2:
             txn_amt = plain_amounts[-2].replace(' ', '').replace(',', '')
             bal_amt = plain_amounts[-1].replace(' ', '').replace(',', '')
-            narration = AMOUNT_PLAIN_RE.sub('', rest).strip()
-            return {"Date": date, "Narration": narration, "Debit": txn_amt, "Credit": "", "Balance": bal_amt}
+            # चेक रेफरेंस हटाने के बाद की narration use करें
+            narration = AMOUNT_PLAIN_RE.sub('', rest_clean).strip()
+            narration = narration.strip(' ,;-')
+            # चेक रेफरेंस को अलग column में add करें
+            cheque_ref = cheque_refs[0] if cheque_refs else ""
+            return {"Date": date, "Narration": narration, "Cheque_Ref": cheque_ref, "Debit": txn_amt, "Credit": "", "Balance": bal_amt}
         else:
-            narration = rest
-            return {"Date": date, "Narration": narration, "Debit": "", "Credit": "", "Balance": ""}
+            narration = rest_clean
+            cheque_ref = cheque_refs[0] if cheque_refs else ""
+            return {"Date": date, "Narration": narration, "Cheque_Ref": cheque_ref, "Debit": "", "Credit": "", "Balance": ""}
+    
     normalized = [(a.replace(' ', '').replace(',', ''), t.lower()) for a, t in amount_tags]
     txn_amt, txn_tag = normalized[0]
     if len(normalized) >= 2:
@@ -144,9 +161,15 @@ def parse_record(rec: str) -> Optional[Dict[str, str]]:
         bal_amt = ""
     debit = txn_amt if txn_tag == 'dr' else ""
     credit = txn_amt if txn_tag == 'cr' else ""
-    narration = AMOUNT_TAG_RE.sub('', rest).strip()
+    
+    # चेक रेफरेंस हटाने के बाद की narration use करें
+    narration = AMOUNT_TAG_RE.sub('', rest_clean).strip()
     narration = narration.strip(' ,;-')
-    return {"Date": date, "Narration": narration, "Debit": debit, "Credit": credit, "Balance": bal_amt}
+    
+    # चेक रेफरेंस को अलग column में add करें
+    cheque_ref = cheque_refs[0] if cheque_refs else ""
+    
+    return {"Date": date, "Narration": narration, "Cheque_Ref": cheque_ref, "Debit": debit, "Credit": credit, "Balance": bal_amt}
 
 def parse_records(records: List[str]) -> pd.DataFrame:
     parsed = []
@@ -154,42 +177,10 @@ def parse_records(records: List[str]) -> pd.DataFrame:
         p = parse_record(r)
         if p:
             parsed.append(p)
-    df = pd.DataFrame(parsed, columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+    # Cheque_Ref column को include करें
+    df = pd.DataFrame(parsed, columns=["Date", "Narration", "Cheque_Ref", "Debit", "Credit", "Balance"])
     df = df.fillna("").astype(str)
     return df
-
-def fix_check_reference_issues(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Fix issues where check reference numbers are incorrectly captured in debit/credit columns.
-    Moves numeric values from Debit/Credit to Narration when they appear to be check references.
-    """
-    df_fixed = df.copy()
-    
-    for idx, row in df_fixed.iterrows():
-        narration = str(row["Narration"])
-        debit = str(row["Debit"])
-        credit = str(row["Credit"])
-        
-        # Check if debit/credit contains what looks like a check reference
-        # Check references are typically 6+ digits without decimal points
-        if debit and debit.isdigit() and len(debit) >= 6:
-            # Move check reference from debit to narration
-            df_fixed.at[idx, "Narration"] = f"{narration} CHQ REF {debit}".strip()
-            df_fixed.at[idx, "Debit"] = ""
-        
-        if credit and credit.isdigit() and len(credit) >= 6:
-            # Move check reference from credit to narration
-            df_fixed.at[idx, "Narration"] = f"{narration} CHQ REF {credit}".strip()
-            df_fixed.at[idx, "Credit"] = ""
-            
-        # Also check for numeric values that might be check references in balance
-        balance = str(row["Balance"])
-        if balance and balance.isdigit() and len(balance) >= 6 and ("CHQ" in narration.upper() or "CHEQUE" in narration.upper()):
-            # This might be a check number in balance column
-            df_fixed.at[idx, "Narration"] = f"{narration} CHQ REF {balance}".strip()
-            df_fixed.at[idx, "Balance"] = ""
-    
-    return df_fixed
 
 # ---------- Main flow ----------
 st.info("Trying fast text extraction (pdfplumber). If insufficient results, OCR will be used.")
@@ -224,34 +215,14 @@ if df.empty:
     st.error("No transactions parsed. If this PDF is scanned and still fails, try increasing DPI or upload a sample page for me to tune preprocessing.")
     st.stop()
 
-# Apply check reference fixes
-st.subheader("Fixing check reference issues...")
-df_fixed = fix_check_reference_issues(df)
-
-# Show comparison of before and after
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("Before fixing check references")
-    st.dataframe(df.head(50))
-
-with col2:
-    st.subheader("After fixing check references")
-    st.dataframe(df_fixed.head(50))
-
-# Show summary of changes
-changes_mask = (df["Debit"] != df_fixed["Debit"]) | (df["Credit"] != df_fixed["Credit"]) | (df["Narration"] != df_fixed["Narration"])
-if changes_mask.any():
-    st.success(f"Fixed {changes_mask.sum()} records with potential check reference issues")
-    changed_records = df_fixed[changes_mask]
-    st.subheader("Changed records:")
-    st.dataframe(changed_records)
-else:
-    st.info("No check reference issues detected")
+# Show parsed dataframe preview
+st.subheader("Parsed table preview")
+st.dataframe(df.head(200))  # show up to 200 rows in preview
 
 # Convert amounts option
 convert_flag = st.checkbox("Convert Debit/Credit/Balance to numeric (strip commas and convert)", value=True)
 if convert_flag:
-    df_conv = df_fixed.copy()
+    df_conv = df.copy()
     for col in ["Debit", "Credit", "Balance"]:
         if col in df_conv.columns:
             df_conv[col] = df_conv[col].replace(r'^\s*$', None, regex=True)
@@ -272,7 +243,7 @@ if convert_flag:
         totals["Last balance (numeric)"] = last_balance
     st.write(totals)
 else:
-    df_conv = df_fixed.copy()
+    df_conv = df.copy()
 
 # Download buttons: CSV and Excel
 def to_excel_bytes(dff: pd.DataFrame) -> bytes:
@@ -308,7 +279,7 @@ if corrected:
     try:
         corrected_df = pd.read_csv(corrected)
         # basic validation: ensure required columns exist
-        expected = {"Date", "Narration", "Debit", "Credit", "Balance"}
+        expected = {"Date", "Narration", "Cheque_Ref", "Debit", "Credit", "Balance"}
         if not expected.issubset(set(corrected_df.columns)):
             st.warning(f"Uploaded CSV columns: {list(corrected_df.columns)}. Expected at least: {sorted(expected)}. App will attempt to continue, but column names may differ.")
         # show preview of corrected and replace df_conv for download
