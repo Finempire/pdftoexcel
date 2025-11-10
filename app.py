@@ -1,7 +1,7 @@
 # app.py
 """
-Streamlit app: Bank statement PDF -> Excel/CSV
-Clean version - Only shows file upload, download button and Excel preview
+Streamlit app: Bank statement PDF -> Excel
+Clean version - Shows bank selection, file upload and download button
 """
 import io
 import re
@@ -21,13 +21,13 @@ st.title("Bank Statement Converter")
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    uploaded = st.file_uploader("Upload bank statement PDF", type=["pdf"])
+    bank_name = st.selectbox(
+        "Select Bank",
+        ["Kotak Mahindra Bank", "HDFC Bank", "ICICI Bank", "State Bank of India", "Axis Bank", "Other Bank"]
+    )
 
 with col2:
-    convert_option = st.selectbox(
-        "Convert to",
-        ["Excel", "CSV"]
-    )
+    uploaded = st.file_uploader("Upload bank statement PDF", type=["pdf"])
 
 with col3:
     if uploaded:
@@ -42,7 +42,7 @@ if not uploaded:
 
 pdf_bytes = uploaded.read()
 
-# Regex patterns
+# Regex patterns for Kotak Bank
 DATE_LINE_RE = re.compile(r'^\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s[A-Za-z]{3}\s\d{4})\s+')
 AMOUNT_TAG_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))\s*\(?\s*(Dr|Cr)\s*\)?', re.IGNORECASE)
 AMOUNT_PLAIN_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))')
@@ -178,32 +178,21 @@ for col in ["Debit", "Credit", "Balance"]:
         df_download[col] = df_download[col].str.replace(',', '', regex=False).str.replace(' ', '', regex=False)
         df_download[col] = pd.to_numeric(df_download[col], errors='coerce')
 
-# Download functions
+# Download function for Excel
 def to_excel_bytes(dff: pd.DataFrame) -> bytes:
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         dff.to_excel(writer, index=False, sheet_name="Statement")
     return out.getvalue()
 
-def to_csv_bytes(dff: pd.DataFrame) -> bytes:
-    return dff.to_csv(index=False).encode('utf-8')
-
 # Download button in the third column
 with col3:
-    if convert_option == "Excel":
-        st.download_button(
-            "Download Excel", 
-            data=to_excel_bytes(df_download),
-            file_name=uploaded.name.replace(".pdf", ".xlsx"),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    else:
-        st.download_button(
-            "Download CSV", 
-            data=to_csv_bytes(df_download),
-            file_name=uploaded.name.replace(".pdf", ".csv"),
-            mime="text/csv"
-        )
+    st.download_button(
+        "Download Excel", 
+        data=to_excel_bytes(df_download),
+        file_name=f"{bank_name.replace(' ', '_')}_{uploaded.name.replace('.pdf', '.xlsx')}",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 # Show parsed dataframe preview below the three columns
 st.markdown("---")
