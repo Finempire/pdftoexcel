@@ -39,7 +39,8 @@ st.sidebar.markdown(f"**Filename:** {uploaded.name} — {len(pdf_bytes)//1024} K
 DATE_LINE_RE = re.compile(r'^\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s[A-Za-z]{3}\s\d{4})\s+')
 AMOUNT_TAG_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))\s*\(?\s*(Dr|Cr)\s*\)?', re.IGNORECASE)
 AMOUNT_PLAIN_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))')
-CHEQUE_REF_RE = re.compile(r'(Chq|Cheque|ChqNo|Chq No|Ref|Reference|Ref No|RefNo)\s*[.:]?\s*(\d+)', re.IGNORECASE)
+# चेक रेफरेंस को पहचानने के लिए improved regex
+CHEQUE_REF_RE = re.compile(r'\b(IMPS|UPI|TBMS|NEFT|RTGS|Chq|Cheque|Ref|Reference)[-/]?[A-Za-z0-9]+\b', re.IGNORECASE)
 
 # ---------- extraction helpers ----------
 def text_from_pdf_bytes(pdf_bytes: bytes) -> List[str]:
@@ -127,14 +128,8 @@ def parse_record(rec: str) -> Optional[Dict[str, str]]:
     date = m.group(1).strip()
     rest = rec[m.end():].strip()
     
-    # चेक रेफरेंस को अलग करें और narration से हटाएं
-    cheque_refs = []
-    def remove_cheque_ref(match):
-        cheque_refs.append(match.group(2))  # सिर्फ नंबर लें
-        return ""
-    
-    # पहले चेक रेफरेंस को हटाएं
-    rest_clean = CHEQUE_REF_RE.sub(remove_cheque_ref, rest)
+    # चेक रेफरेंस को पूरी तरह से हटाएं (कोई अलग कॉलम नहीं)
+    rest_clean = CHEQUE_REF_RE.sub('', rest)
     
     amount_tags = AMOUNT_TAG_RE.findall(rest_clean)
     if not amount_tags:
@@ -142,16 +137,12 @@ def parse_record(rec: str) -> Optional[Dict[str, str]]:
         if len(plain_amounts) >= 2:
             txn_amt = plain_amounts[-2].replace(' ', '').replace(',', '')
             bal_amt = plain_amounts[-1].replace(' ', '').replace(',', '')
-            # चेक रेफरेंस हटाने के बाद की narration use करें
             narration = AMOUNT_PLAIN_RE.sub('', rest_clean).strip()
             narration = narration.strip(' ,;-')
-            # चेक रेफरेंस को अलग column में add करें
-            cheque_ref = cheque_refs[0] if cheque_refs else ""
-            return {"Date": date, "Narration": narration, "Cheque_Ref": cheque_ref, "Debit": txn_amt, "Credit": "", "Balance": bal_amt}
+            return {"Date": date, "Narration": narration, "Debit": txn_amt, "Credit": "", "Balance": bal_amt}
         else:
             narration = rest_clean
-            cheque_ref = cheque_refs[0] if cheque_refs else ""
-            return {"Date": date, "Narration": narration, "Cheque_Ref": cheque_ref, "Debit": "", "Credit": "", "Balance": ""}
+            return {"Date": date, "Narration": narration, "Debit": "", "Credit": "", "Balance": ""}
     
     normalized = [(a.replace(' ', '').replace(',', ''), t.lower()) for a, t in amount_tags]
     txn_amt, txn_tag = normalized[0]
@@ -162,14 +153,10 @@ def parse_record(rec: str) -> Optional[Dict[str, str]]:
     debit = txn_amt if txn_tag == 'dr' else ""
     credit = txn_amt if txn_tag == 'cr' else ""
     
-    # चेक रेफरेंस हटाने के बाद की narration use करें
     narration = AMOUNT_TAG_RE.sub('', rest_clean).strip()
     narration = narration.strip(' ,;-')
     
-    # चेक रेफरेंस को अलग column में add करें
-    cheque_ref = cheque_refs[0] if cheque_refs else ""
-    
-    return {"Date": date, "Narration": narration, "Cheque_Ref": cheque_ref, "Debit": debit, "Credit": credit, "Balance": bal_amt}
+    return {"Date": date, "Narration": narration, "Debit": debit, "Credit": credit, "Balance": bal_amt}
 
 def parse_records(records: List[str]) -> pd.DataFrame:
     parsed = []
@@ -177,8 +164,8 @@ def parse_records(records: List[str]) -> pd.DataFrame:
         p = parse_record(r)
         if p:
             parsed.append(p)
-    # Cheque_Ref column को include करें
-    df = pd.DataFrame(parsed, columns=["Date", "Narration", "Cheque_Ref", "Debit", "Credit", "Balance"])
+    # Cheque_Ref column को हटा दिया गया है
+    df = pd.DataFrame(parsed, columns=["Date", "Narration", "Debit", "Credit", "Balance"])
     df = df.fillna("").astype(str)
     return df
 
@@ -279,7 +266,7 @@ if corrected:
     try:
         corrected_df = pd.read_csv(corrected)
         # basic validation: ensure required columns exist
-        expected = {"Date", "Narration", "Cheque_Ref", "Debit", "Credit", "Balance"}
+        expected = {"Date", "Narration", "Debit", "Credit", "Balance"}
         if not expected.issubset(set(corrected_df.columns)):
             st.warning(f"Uploaded CSV columns: {list(corrected_df.columns)}. Expected at least: {sorted(expected)}. App will attempt to continue, but column names may differ.")
         # show preview of corrected and replace df_conv for download
