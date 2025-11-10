@@ -1,7 +1,7 @@
 # app.py
 """
 Streamlit app: Bank statement PDF -> Excel/CSV
-Clean version - Only shows Excel preview and download buttons
+Clean version - Only shows file upload, download button and Excel preview
 """
 import io
 import re
@@ -17,9 +17,27 @@ import pytesseract
 st.set_page_config(page_title="Bank PDF → Excel", layout="wide")
 st.title("Bank Statement Converter")
 
-uploaded = st.file_uploader("Upload bank statement PDF", type=["pdf"])
+# Create three columns at the top
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    uploaded = st.file_uploader("Upload bank statement PDF", type=["pdf"])
+
+with col2:
+    convert_option = st.selectbox(
+        "Convert to",
+        ["Excel", "CSV"]
+    )
+
+with col3:
+    if uploaded:
+        st.markdown("### Download")
+    else:
+        st.markdown("### Download")
+        st.info("Upload PDF first")
+
 if not uploaded:
-    st.info("Upload a PDF to begin.")
+    st.info("Please upload a PDF file to begin conversion.")
     st.stop()
 
 pdf_bytes = uploaded.read()
@@ -152,10 +170,6 @@ if df.empty:
     st.error("No transactions parsed. Please try with a different PDF.")
     st.stop()
 
-# Show parsed dataframe preview
-st.subheader("Excel Preview")
-st.dataframe(df)
-
 # Automatically convert amounts to numeric for download
 df_download = df.copy()
 for col in ["Debit", "Credit", "Balance"]:
@@ -164,7 +178,7 @@ for col in ["Debit", "Credit", "Balance"]:
         df_download[col] = df_download[col].str.replace(',', '', regex=False).str.replace(' ', '', regex=False)
         df_download[col] = pd.to_numeric(df_download[col], errors='coerce')
 
-# Download buttons: CSV and Excel
+# Download functions
 def to_excel_bytes(dff: pd.DataFrame) -> bytes:
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
@@ -174,13 +188,24 @@ def to_excel_bytes(dff: pd.DataFrame) -> bytes:
 def to_csv_bytes(dff: pd.DataFrame) -> bytes:
     return dff.to_csv(index=False).encode('utf-8')
 
-st.markdown("### Download")
-col1, col2 = st.columns(2)
-with col1:
-    st.download_button("Download Excel (.xlsx)", data=to_excel_bytes(df_download),
-                       file_name=uploaded.name.replace(".pdf", ".xlsx"),
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-with col2:
-    st.download_button("Download CSV", data=to_csv_bytes(df_download),
-                       file_name=uploaded.name.replace(".pdf", ".csv"),
-                       mime="text/csv")
+# Download button in the third column
+with col3:
+    if convert_option == "Excel":
+        st.download_button(
+            "Download Excel", 
+            data=to_excel_bytes(df_download),
+            file_name=uploaded.name.replace(".pdf", ".xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.download_button(
+            "Download CSV", 
+            data=to_csv_bytes(df_download),
+            file_name=uploaded.name.replace(".pdf", ".csv"),
+            mime="text/csv"
+        )
+
+# Show parsed dataframe preview below the three columns
+st.markdown("---")
+st.subheader("Excel Preview")
+st.dataframe(df)
