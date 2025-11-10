@@ -7,3 +7,4 @@ pandas
 openpyxl
 opencv-python
 chardet
+PyPDF2
