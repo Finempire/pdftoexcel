@@ -6,3 +6,4 @@ pillow
 pandas
 openpyxl
 opencv-python
+chardet
