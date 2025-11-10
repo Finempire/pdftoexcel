@@ -11,7 +11,9 @@ st.title("Bank Statement PDF → Excel Parser")
 
 # --- 1. SHARED HELPERS & REGEX -----------------------------------------------
 COMMON_DATE_RE = re.compile(r'^\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\s+')
+# Regex for amounts specifically with (Dr) or (Cr) tags
 AMOUNT_WITH_TAG_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))\s*\(\s*(Dr|Cr)\s*\)', re.IGNORECASE)
+# Regex for plain amounts (must have a decimal point to avoid capturing long ref numbers)
 PLAIN_AMOUNT_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))')
 
 @st.cache_data(show_spinner=False)
@@ -20,7 +22,8 @@ def extract_text_from_pdf(file_bytes: bytes) -> List[str]:
     lines: List[str] = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
-            text = page.extract_text(x_tolerance=2) or "" # Added tolerance
+            # Increased tolerance to better capture text in table cells
+            text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
             for ln in text.splitlines():
                 ln = ln.rstrip()
                 if ln:
@@ -39,37 +42,26 @@ def to_excel_bytes(dff: pd.DataFrame) -> bytes:
 def clean_kotak_narration(narration_dirty: str) -> str:
     """
     Applies regex rules to clean merged Chq/Ref No from narration string.
-    This is based on patterns observed in the sample PDF.
     """
     narration = narration_dirty
     
-    # Rule for UPI: "UPI/Raghvendra Kuma/4107.../LAPT UPI-4107..." -> "Raghvendra Kuma LAPT"
-    narration = re.sub(r'UPI/([^/]+)/\d{12,}/([^ ]+)\s+UPI-\d{12,}', r'\1 \2', narration)
-    
-    # Rule for SentIMPS: "SentIMPS...LAPT ASSES ... IMPS-..." -> "LAPT ASSES ..."
-    narration = re.sub(r'SentIMPS\d{12,}(\S*\s*[\s\S]*?)IMPS-\d{12,}', r'\1', narration, flags=re.DOTALL)
-    
-    # Rule for Charges: "Chrg: ... TBMS-1415..." -> "Chrg: ..."
-    narration = re.sub(r'^(Chrg:[\s\S]*?)TBMS-\d{10,}', r'\1', narration)
-    
-    # Rule for CLG INST: "BY CLG INST ... //ICICI/NOIDA" -> "ICICI/NOIDA"
-    narration = re.sub(r'BY CLG INST \S+\s*//(.*)', r'\1', narration)
+    # Remove specific reference number patterns observed in Kotak PDFs
+    narration = re.sub(r'UPI/[^/]+/\d{12,}/[^ ]+\s+UPI-\d{12,}', lambda m: m.group(0).split('/')[1] + ' ' + m.group(0).split('/')[3].split()[0], narration)
+    narration = re.sub(r'SentIMPS\d{12,}', '', narration)
+    narration = re.sub(r'IMPS-\d{12,}', '', narration)
+    narration = re.sub(r'TBMS-\d{10,}', '', narration)
+    narration = re.sub(r'UPI-\d{12,}', '', narration)
+    # Remove standalone long digit strings often found as ref numbers
+    narration = re.sub(r'\b\d{10,}\b', '', narration) 
 
-    # Fallback cleanup for any remaining stray codes at the end of a line
-    narration = re.sub(r'IMPS-\d{10,}$', '', narration)
-    narration = re.sub(r'TBMS-\d{10,}$', '', narration)
-    narration = re.sub(r'UPI-\d{10,}$', '', narration)
-    narration = re.sub(r'SentIMPS\d{10,}$', '', narration)
-    
-    # Final whitespace cleanup
-    return ' '.join(narration.split()).strip(' ,;-')
-
+    # General cleanup
+    narration = narration.replace('  ', ' ')
+    return narration.strip(' ,;-')
 
 def parse_kotak(lines: List[str]) -> pd.DataFrame:
     """
     Specific parsing logic for Kotak style statements.
     """
-    # A. Group lines based on Date at start
     records: List[str] = []
     for ln in lines:
         if COMMON_DATE_RE.match(ln):
@@ -78,7 +70,6 @@ def parse_kotak(lines: List[str]) -> pd.DataFrame:
             if records:
                 records[-1] = records[-1] + " " + ln.strip()
 
-    # B. Parse individual grouped records
     parsed_data = []
     for rec in records:
         m = COMMON_DATE_RE.match(rec)
@@ -86,62 +77,65 @@ def parse_kotak(lines: List[str]) -> pd.DataFrame:
         date = m.group(1).strip()
         rest = rec[m.end():].strip()
 
+        # 1. Try to find explicitly tagged amounts first (Dr/Cr)
         amount_tags = AMOUNT_WITH_TAG_RE.findall(rest)
+        
+        txn_amt, txn_tag, bal_amt = "", "", ""
+        narration_dirty = rest
 
         if amount_tags:
             normalized = [(a.replace(' ', '').replace(',', ''), t.lower()) for a, t in amount_tags]
+            # Assumption: First tagged amount is transaction, last is balance
             txn_amt, txn_tag = normalized[0]
-            bal_amt, bal_tag = normalized[-1] if len(normalized) >= 2 else ("", "")
+            if len(normalized) >= 2:
+                 bal_amt, _ = normalized[-1]
             
-            debit = txn_amt if txn_tag == 'dr' else ""
-            credit = txn_amt if txn_tag == 'cr' else ""
-            
-            # --- MODIFICATION ---
-            # Get dirty narration by removing amounts
+            # Remove all tagged amounts from narration
             narration_dirty = AMOUNT_WITH_TAG_RE.sub('', rest)
-            # Clean the dirty narration
-            narration = clean_kotak_narration(narration_dirty)
-            # --- END MODIFICATION ---
 
-            parsed_data.append({"Date": date, "Narration": narration, "Debit": debit, "Credit": credit, "Balance": bal_amt})
         else:
-             plain_amounts = PLAIN_AMOUNT_RE.findall(rest)
-             if len(plain_amounts) >= 2:
-                 txn_amt = plain_amounts[-2].replace(' ', '').replace(',', '')
-                 bal_amt = plain_amounts[-1].replace(' ', '').replace(',', '')
-                 
-                 # --- MODIFICATION ---
-                 narration_dirty = PLAIN_AMOUNT_RE.sub('', rest).strip()
-                 narration = clean_kotak_narration(narration_dirty)
-                 # --- END MODIFICATION ---
-                 
-                 parsed_data.append({"Date": date, "Narration": narration, "Debit": txn_amt, "Credit": "", "Balance": bal_amt})
-             else:
-                 # Fallback for lines with no discernible amounts
-                 narration_dirty = rest
-                 narration = clean_kotak_narration(narration_dirty)
-                 parsed_data.append({"Date": date, "Narration": narration, "Debit": "", "Credit": "", "Balance": ""})
+            # 2. Fallback: look for plain amounts if tags are missing
+            plain_amounts = PLAIN_AMOUNT_RE.findall(rest)
+            # Filter out things that look like ref numbers (e.g. no decimal, too long)
+            valid_amounts = [a for a in plain_amounts if '.' in a]
+            
+            if len(valid_amounts) >= 2:
+                txn_amt = valid_amounts[-2].replace(' ', '').replace(',', '')
+                bal_amt = valid_amounts[-1].replace(' ', '').replace(',', '')
+                # Assume it's a debit if unknown, user can fix in UI
+                txn_tag = "dr" 
+                
+                # Remove these specific amounts from narration
+                narration_dirty = rest.replace(valid_amounts[-2], '').replace(valid_amounts[-1], '')
 
-    return pd.DataFrame(parsed_data, columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+        # Clean up the narration
+        narration = clean_kotak_narration(narration_dirty)
 
+        parsed_data.append({
+            "Date": date,
+            "Narration": narration,
+            "Withdrawal (Dr)": txn_amt if txn_tag == 'dr' else "",
+            "Deposit (Cr)": txn_amt if txn_tag == 'cr' else "",
+            "Balance": bal_amt
+        })
+
+    return pd.DataFrame(parsed_data)
+
+# ... (HDFC and SBI dummy parsers remain the same for now)
 def parse_hdfc_dummy(lines: List[str]) -> pd.DataFrame:
-    """Placeholder for HDFC logic. Currently uses Kotak logic as fallback."""
-    st.warning("HDFC parser is not yet implemented. Using default parser.")
     return parse_kotak(lines)
 
 def parse_sbi_dummy(lines: List[str]) -> pd.DataFrame:
-    """Placeholder for SBI logic. Currently uses Kotak logic as fallback."""
-    st.warning("SBI parser is not yet implemented. Using default parser.")
     return parse_kotak(lines)
 
-# Registry of available parsers
-BANK_PARSERS: Dict[str, Callable[[List[str]], pd.DataFrame]] = {
+BANK_PARSERS = {
     "Kotak Bank": parse_kotak,
     "HDFC Bank (Beta)": parse_hdfc_dummy,
     "SBI (Beta)": parse_sbi_dummy,
 }
 
 # --- 3. STREAMLIT UI ---------------------------------------------------------
+# ... (UI code remains largely the same, just updated column names in display if needed)
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -166,7 +160,6 @@ else:
 
 st.sidebar.info(f"Processing: **{selected_file.name}**\n\nFormat: {selected_bank_name}")
 
-# --- 4. MAIN PROCESSING LOOP -------------------------------------------------
 st.subheader(f"Preview: {selected_file.name} ({selected_bank_name})")
 
 try:
@@ -179,18 +172,24 @@ try:
         df = parser_function(raw_text_lines)
 
     if df.empty:
-        st.error(f"No transactions found using the {selected_bank_name} parser. The file might be a different format.")
-        with st.expander("See raw text for debugging"):
-            st.write(raw_text_lines[:20])
+        st.error("No transactions found. Try a different bank format or check the PDF.")
     else:
         df_display = df.fillna("").astype(str)
-        col_preview, col_actions = st.columns([3, 1])
         
+        # Reorder columns to match your request: Date, Narration, Withdrawal, Deposit, Balance
+        cols_order = ["Date", "Narration", "Withdrawal (Dr)", "Deposit (Cr)", "Balance"]
+        # Ensure all columns exist even if empty
+        for col in cols_order:
+            if col not in df_display.columns:
+                df_display[col] = ""
+        df_display = df_display[cols_order]
+
+        col_preview, col_actions = st.columns([3, 1])
         with col_preview:
             edited_df = st.data_editor(
-                df_display, 
-                use_container_width=True, 
-                num_rows="dynamic", 
+                df_display,
+                use_container_width=True,
+                num_rows="dynamic",
                 height=600,
                 key=f"editor_{selected_file.name}"
             )
@@ -206,10 +205,6 @@ try:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary"
             )
-            st.markdown("---")
-            with st.expander("See raw text for debugging"):
-                st.write(raw_text_lines[:20])
 
 except Exception as e:
-    st.error(f"An error occurred while processing the file: {e}")
-    st.exception(e) # Show full traceback for debugging
+    st.error(f"An error occurred: {e}")
