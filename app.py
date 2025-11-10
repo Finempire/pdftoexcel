@@ -4,6 +4,9 @@ from datetime import datetime
 import streamlit as st
 from typing import Tuple, Dict, List
 import io
+import chardet
+import PyPDF2
+import pdfplumber
 
 # Base Parser Class
 class BankStatementParser:
@@ -17,7 +20,7 @@ class BankStatementParser:
             if not date_str or date_str.strip() == '':
                 return None
             # Try different date formats
-            for fmt in ['%d/%m/%y', '%d/%m/%Y', '%d-%m-%Y', '%d-%m-%y']:
+            for fmt in ['%d/%m/%y', '%d/%m/%Y', '%d-%m-%Y', '%d-%m-%y', '%d.%m.%Y', '%d %b %Y']:
                 try:
                     return datetime.strptime(date_str.strip(), fmt)
                 except:
@@ -32,7 +35,7 @@ class BankStatementParser:
             return 0.0
         try:
             # Remove commas and any non-numeric characters except decimal point
-            cleaned = re.sub(r'[^\d.]', '', amount_str.replace(',', ''))
+            cleaned = re.sub(r'[^\d.]', '', str(amount_str).replace(',', ''))
             return float(cleaned) if cleaned else 0.0
         except:
             return 0.0
@@ -322,6 +325,97 @@ class KotakStatementParser(BankStatementParser):
             print(f"Kotak Transaction parsing error: {e}")
             return None
 
+# File Processing Utilities
+class FileProcessor:
+    @staticmethod
+    def detect_encoding(content: bytes) -> str:
+        """Detect file encoding"""
+        try:
+            result = chardet.detect(content)
+            encoding = result.get('encoding', 'utf-8')
+            confidence = result.get('confidence', 0)
+            
+            # Fallback to common encodings if confidence is low
+            if confidence < 0.7:
+                encodings_to_try = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+                for enc in encodings_to_try:
+                    try:
+                        content.decode(enc)
+                        return enc
+                    except UnicodeDecodeError:
+                        continue
+            return encoding or 'utf-8'
+        except:
+            return 'utf-8'
+    
+    @staticmethod
+    def extract_text_from_pdf(pdf_content: bytes) -> str:
+        """Extract text from PDF using multiple methods"""
+        text = ""
+        
+        # Method 1: Try pdfplumber (better for text extraction)
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+            if text.strip():
+                return text
+        except Exception as e:
+            st.warning(f"pdfplumber failed: {e}")
+        
+        # Method 2: Try PyPDF2 as fallback
+        try:
+            pdf_file = io.BytesIO(pdf_content)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            for page in pdf_reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+        except Exception as e:
+            st.warning(f"PyPDF2 failed: {e}")
+        
+        return text
+    
+    @staticmethod
+    def process_uploaded_file(uploaded_file) -> str:
+        """Process uploaded file and return text content"""
+        try:
+            file_content = uploaded_file.getvalue()
+            
+            # Check if it's PDF
+            if uploaded_file.type == 'application/pdf' or uploaded_file.name.lower().endswith('.pdf'):
+                st.info("📄 PDF file detected. Extracting text...")
+                text_content = FileProcessor.extract_text_from_pdf(file_content)
+                if not text_content.strip():
+                    raise Exception("No text could be extracted from PDF")
+                return text_content
+            
+            # For text files, detect encoding and decode
+            else:
+                encoding = FileProcessor.detect_encoding(file_content)
+                st.info(f"📝 Text file detected. Using encoding: {encoding}")
+                return file_content.decode(encoding)
+                
+        except UnicodeDecodeError as e:
+            st.error(f"Encoding error: {e}")
+            # Try fallback encodings
+            fallback_encodings = ['latin-1', 'cp1252', 'iso-8859-1', 'utf-16']
+            file_content = uploaded_file.getvalue()
+            
+            for encoding in fallback_encodings:
+                try:
+                    st.info(f"Trying fallback encoding: {encoding}")
+                    return file_content.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+            
+            raise Exception(f"Could not decode file with any encoding. Tried: {fallback_encodings}")
+        
+        except Exception as e:
+            raise Exception(f"File processing error: {str(e)}")
+
 # Main Parser Factory
 class BankStatementProcessor:
     def __init__(self):
@@ -356,6 +450,7 @@ def main():
     
     # Initialize processor
     processor = BankStatementProcessor()
+    file_processor = FileProcessor()
     
     # Sidebar for bank selection
     st.sidebar.header("Bank Selection")
@@ -368,15 +463,24 @@ def main():
     # File upload
     uploaded_file = st.file_uploader(
         f"Upload {selected_bank} Statement",
-        type=['pdf', 'txt'],
-        help=f"Upload {selected_bank} statement in PDF or text format"
+        type=['pdf', 'txt', 'csv'],
+        help=f"Upload {selected_bank} statement in PDF, TXT, or CSV format"
     )
     
     if uploaded_file:
         try:
-            # Read file content
-            text_content = uploaded_file.getvalue().decode('utf-8')
+            # Process file and get text content
+            with st.spinner("Processing file..."):
+                text_content = file_processor.process_uploaded_file(uploaded_file)
             
+            # Show file info
+            st.success(f"✅ File processed successfully! Size: {len(text_content)} characters")
+            
+            # Optional: Show raw text preview
+            with st.expander("📋 View Raw Text Preview"):
+                st.text_area("Raw Text (first 2000 chars)", text_content[:2000], height=200)
+            
+            # Parse statement
             with st.spinner(f"Parsing {selected_bank} statement..."):
                 df, account_info = processor.parse_statement(selected_bank, text_content)
             
@@ -391,6 +495,8 @@ def main():
                         info_data.append({"Field": key, "Value": value})
                     info_df = pd.DataFrame(info_data)
                     st.table(info_df)
+                else:
+                    st.info("No account information found in the statement")
                 
                 # Display transaction summary
                 st.subheader("💰 Transaction Summary")
@@ -415,23 +521,27 @@ def main():
                 # Add filters
                 col1, col2 = st.columns(2)
                 with col1:
-                    date_range = st.date_input(
-                        "Filter by Date Range",
-                        value=(df['Date'].min(), df['Date'].max()),
-                        min_value=df['Date'].min(),
-                        max_value=df['Date'].max()
-                    )
+                    if not df.empty and df['Date'].notna().any():
+                        min_date = df['Date'].min()
+                        max_date = df['Date'].max()
+                        date_range = st.date_input(
+                            "Filter by Date Range",
+                            value=(min_date, max_date),
+                            min_value=min_date,
+                            max_value=max_date
+                        )
                 
                 with col2:
                     search_term = st.text_input("Search in Narration")
                 
                 # Apply filters
                 filtered_df = df.copy()
-                if len(date_range) == 2:
-                    filtered_df = filtered_df[
-                        (filtered_df['Date'] >= pd.to_datetime(date_range[0])) & 
-                        (filtered_df['Date'] <= pd.to_datetime(date_range[1]))
-                    ]
+                if not df.empty and df['Date'].notna().any():
+                    if len(date_range) == 2:
+                        filtered_df = filtered_df[
+                            (filtered_df['Date'] >= pd.to_datetime(date_range[0])) & 
+                            (filtered_df['Date'] <= pd.to_datetime(date_range[1]))
+                        ]
                 
                 if search_term:
                     filtered_df = filtered_df[
@@ -447,36 +557,40 @@ def main():
                 
                 with tab1:
                     # Monthly summary
-                    monthly_df = df.copy()
-                    monthly_df['Month'] = monthly_df['Date'].dt.to_period('M')
-                    monthly_summary = monthly_df.groupby('Month').agg({
-                        'Debit': 'sum',
-                        'Credit': 'sum',
-                        'Date': 'count'
-                    }).rename(columns={'Date': 'Transaction Count'})
-                    
-                    st.write("Monthly Transaction Summary:")
-                    st.dataframe(monthly_summary)
-                    
-                    # Monthly chart
-                    monthly_chart_data = monthly_summary[['Debit', 'Credit']].reset_index()
-                    monthly_chart_data['Month'] = monthly_chart_data['Month'].astype(str)
-                    st.bar_chart(monthly_chart_data.set_index('Month'))
+                    if not df.empty and df['Date'].notna().any():
+                        monthly_df = df.copy()
+                        monthly_df['Month'] = monthly_df['Date'].dt.to_period('M')
+                        monthly_summary = monthly_df.groupby('Month').agg({
+                            'Debit': 'sum',
+                            'Credit': 'sum',
+                            'Date': 'count'
+                        }).rename(columns={'Date': 'Transaction Count'})
+                        
+                        st.write("Monthly Transaction Summary:")
+                        st.dataframe(monthly_summary)
+                        
+                        # Monthly chart
+                        monthly_chart_data = monthly_summary[['Debit', 'Credit']].reset_index()
+                        monthly_chart_data['Month'] = monthly_chart_data['Month'].astype(str)
+                        st.bar_chart(monthly_chart_data.set_index('Month'))
+                    else:
+                        st.info("No date data available for monthly analysis")
                 
                 with tab2:
                     # Transaction type analysis
-                    df['Transaction Type'] = df.apply(
-                        lambda x: 'Debit' if x['Debit'] > 0 else 'Credit', 
-                        axis=1
-                    )
-                    type_counts = df['Transaction Type'].value_counts()
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.write("Transaction Type Distribution:")
-                        st.dataframe(type_counts)
-                    with col2:
-                        st.bar_chart(type_counts)
+                    if not df.empty:
+                        df['Transaction Type'] = df.apply(
+                            lambda x: 'Debit' if x['Debit'] > 0 else 'Credit', 
+                            axis=1
+                        )
+                        type_counts = df['Transaction Type'].value_counts()
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.write("Transaction Type Distribution:")
+                            st.dataframe(type_counts)
+                        with col2:
+                            st.bar_chart(type_counts)
                 
                 with tab3:
                     # Export options
@@ -510,8 +624,14 @@ def main():
                 st.error("❌ No transactions found in the statement")
                 
         except Exception as e:
-            st.error(f"❌ Error parsing statement: {str(e)}")
-            st.info("💡 Tip: Make sure you've selected the correct bank and uploaded a valid statement file.")
+            st.error(f"❌ Error processing statement: {str(e)}")
+            st.info("""
+            💡 **Troubleshooting Tips:**
+            - Make sure you've selected the correct bank
+            - Ensure the file is not password protected
+            - Try uploading a different file format (PDF/TXT)
+            - Check if the statement contains transaction data
+            """)
     
     else:
         # Show instructions when no file is uploaded
@@ -530,17 +650,31 @@ def main():
             - **Credit**: Amount deposited  
             - **Balance**: Closing balance after transaction
             
+            ### Supported File Formats:
+            - **PDF**: Bank statements in PDF format (text-based, not scanned)
+            - **TXT**: Plain text files
+            - **CSV**: Comma-separated values
+            
             ### File Requirements:
-            - PDF files with extractable text
-            - Text files with statement content
-            - Clear transaction tables with dates and amounts
+            - Files should contain extractable text
+            - PDFs should not be scanned images (OCR not supported yet)
+            - Minimum file size: 1KB, Maximum: 200MB
             
             ### How to Use:
             1. Select your bank from the dropdown
-            2. Upload your statement PDF/text file
+            2. Upload your statement file
             3. View parsed data and analysis
             4. Download results in CSV/Excel format
             """)
 
+# Required installations
+def show_installation_instructions():
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Installation Requirements")
+    st.sidebar.code("""
+pip install pandas streamlit chardet PyPDF2 pdfplumber openpyxl
+""")
+
 if __name__ == "__main__":
+    show_installation_instructions()
     main()
