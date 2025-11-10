@@ -42,13 +42,7 @@ if not uploaded:
 
 pdf_bytes = uploaded.read()
 
-# Regex patterns for Kotak Bank
-DATE_LINE_RE = re.compile(r'^\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s[A-Za-z]{3}\s\d{4})\s+')
-AMOUNT_TAG_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))\s*\(?\s*(Dr|Cr)\s*\)?', re.IGNORECASE)
-AMOUNT_PLAIN_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))')
-CHEQUE_REF_RE = re.compile(r'\b(IMPS|UPI|TBMS|NEFT|RTGS|Chq|Cheque|Ref|Reference)[-/]?[A-Za-z0-9]+\b', re.IGNORECASE)
-
-# ---------- extraction helpers ----------
+# ---------- Common extraction helpers ----------
 def text_from_pdf_bytes(pdf_bytes: bytes) -> List[str]:
     lines: List[str] = []
     try:
@@ -109,52 +103,171 @@ def group_lines_into_records(lines: List[str]) -> List[str]:
                 records.append(ln.strip())
     return records
 
-def parse_record(rec: str) -> Optional[Dict[str, str]]:
-    m = DATE_LINE_RE.match(rec)
-    if not m:
-        return None
-    date = m.group(1).strip()
-    rest = rec[m.end():].strip()
-    
-    # चेक रेफरेंस को पूरी तरह से हटाएं
-    rest_clean = CHEQUE_REF_RE.sub('', rest)
-    
-    amount_tags = AMOUNT_TAG_RE.findall(rest_clean)
-    if not amount_tags:
-        plain_amounts = AMOUNT_PLAIN_RE.findall(rest_clean)
-        if len(plain_amounts) >= 2:
-            txn_amt = plain_amounts[-2].replace(' ', '').replace(',', '')
-            bal_amt = plain_amounts[-1].replace(' ', '').replace(',', '')
-            narration = AMOUNT_PLAIN_RE.sub('', rest_clean).strip()
-            narration = narration.strip(' ,;-')
-            return {"Date": date, "Narration": narration, "Debit": txn_amt, "Credit": "", "Balance": bal_amt}
-        else:
-            narration = rest_clean
-            return {"Date": date, "Narration": narration, "Debit": "", "Credit": "", "Balance": ""}
-    
-    normalized = [(a.replace(' ', '').replace(',', ''), t.lower()) for a, t in amount_tags]
-    txn_amt, txn_tag = normalized[0]
-    if len(normalized) >= 2:
-        bal_amt, bal_tag = normalized[-1]
-    else:
-        bal_amt = ""
-    debit = txn_amt if txn_tag == 'dr' else ""
-    credit = txn_amt if txn_tag == 'cr' else ""
-    
-    narration = AMOUNT_TAG_RE.sub('', rest_clean).strip()
-    narration = narration.strip(' ,;-')
-    
-    return {"Date": date, "Narration": narration, "Debit": debit, "Credit": credit, "Balance": bal_amt}
+# ---------- Kotak Bank Parser ----------
+if bank_name == "Kotak Mahindra Bank":
+    # Regex patterns for Kotak Bank
+    DATE_LINE_RE = re.compile(r'^\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s[A-Za-z]{3}\s\d{4})\s+')
+    AMOUNT_TAG_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))\s*\(?\s*(Dr|Cr)\s*\)?', re.IGNORECASE)
+    AMOUNT_PLAIN_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))')
+    CHEQUE_REF_RE = re.compile(r'\b(IMPS|UPI|TBMS|NEFT|RTGS|Chq|Cheque|Ref|Reference)[-/]?[A-Za-z0-9]+\b', re.IGNORECASE)
 
-def parse_records(records: List[str]) -> pd.DataFrame:
-    parsed = []
-    for r in records:
-        p = parse_record(r)
-        if p:
-            parsed.append(p)
-    df = pd.DataFrame(parsed, columns=["Date", "Narration", "Debit", "Credit", "Balance"])
-    df = df.fillna("").astype(str)
-    return df
+    def parse_record(rec: str) -> Optional[Dict[str, str]]:
+        m = DATE_LINE_RE.match(rec)
+        if not m:
+            return None
+        date = m.group(1).strip()
+        rest = rec[m.end():].strip()
+        
+        # चेक रेफरेंस को पूरी तरह से हटाएं
+        rest_clean = CHEQUE_REF_RE.sub('', rest)
+        
+        amount_tags = AMOUNT_TAG_RE.findall(rest_clean)
+        if not amount_tags:
+            plain_amounts = AMOUNT_PLAIN_RE.findall(rest_clean)
+            if len(plain_amounts) >= 2:
+                txn_amt = plain_amounts[-2].replace(' ', '').replace(',', '')
+                bal_amt = plain_amounts[-1].replace(' ', '').replace(',', '')
+                narration = AMOUNT_PLAIN_RE.sub('', rest_clean).strip()
+                narration = narration.strip(' ,;-')
+                return {"Date": date, "Narration": narration, "Debit": txn_amt, "Credit": "", "Balance": bal_amt}
+            else:
+                narration = rest_clean
+                return {"Date": date, "Narration": narration, "Debit": "", "Credit": "", "Balance": ""}
+        
+        normalized = [(a.replace(' ', '').replace(',', ''), t.lower()) for a, t in amount_tags]
+        txn_amt, txn_tag = normalized[0]
+        if len(normalized) >= 2:
+            bal_amt, bal_tag = normalized[-1]
+        else:
+            bal_amt = ""
+        debit = txn_amt if txn_tag == 'dr' else ""
+        credit = txn_amt if txn_tag == 'cr' else ""
+        
+        narration = AMOUNT_TAG_RE.sub('', rest_clean).strip()
+        narration = narration.strip(' ,;-')
+        
+        return {"Date": date, "Narration": narration, "Debit": debit, "Credit": credit, "Balance": bal_amt}
+
+    def parse_records(records: List[str]) -> pd.DataFrame:
+        parsed = []
+        for r in records:
+            p = parse_record(r)
+            if p:
+                parsed.append(p)
+        df = pd.DataFrame(parsed, columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+        df = df.fillna("").astype(str)
+        return df
+
+# ---------- HDFC Bank Parser ----------
+elif bank_name == "HDFC Bank":
+    # Regex patterns for HDFC Bank
+    DATE_LINE_RE = re.compile(r'^\s*(\d{1,2}/\d{1,2}/\d{2,4})\s+')
+    AMOUNT_RE = re.compile(r'(\d{1,3}(?:,\d{3})*(?:\.\d{2}))')
+    VALUE_DT_RE = re.compile(r'\s(\d{1,2}/\d{1,2}/\d{2,4})\s*$')
+
+    def parse_record(rec: str) -> Optional[Dict[str, str]]:
+        m = DATE_LINE_RE.match(rec)
+        if not m:
+            return None
+        date = m.group(1).strip()
+        rest = rec[m.end():].strip()
+
+        # Remove trailing 'value date' if present
+        rest = VALUE_DT_RE.sub('', rest).strip()
+
+        # Find amounts
+        amounts = AMOUNT_RE.findall(rest)
+        amounts_norm = [a.replace(',', '') for a in amounts]
+
+        # Remove amounts from narration
+        narration = AMOUNT_RE.sub('', rest).strip()
+
+        # Remove trailing numeric ref tokens
+        narration = re.sub(r'\b\d{6,}\b', '', narration).strip()
+        narration = narration.strip(' ,;-')
+
+        debit = ""
+        credit = ""
+        balance = ""
+
+        if len(amounts_norm) >= 3:
+            debit = amounts_norm[0]
+            credit = amounts_norm[1]
+            balance = amounts_norm[-1]
+        elif len(amounts_norm) == 2:
+            debit = amounts_norm[0]
+            balance = amounts_norm[1]
+        elif len(amounts_norm) == 1:
+            balance = amounts_norm[0]
+
+        return {
+            "Date": date,
+            "Narration": narration,
+            "Debit": debit,
+            "Credit": credit,
+            "Balance": balance
+        }
+
+    def parse_records(records: List[str]) -> pd.DataFrame:
+        parsed = []
+        for r in records:
+            p = parse_record(r)
+            if p:
+                parsed.append(p)
+        df = pd.DataFrame(parsed, columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+        df = df.fillna("").astype(str)
+        return df
+
+# ---------- Other Banks (Generic Parser) ----------
+else:
+    # Generic regex patterns for other banks
+    DATE_LINE_RE = re.compile(r'^\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s[A-Za-z]{3}\s\d{4})\s+')
+    AMOUNT_TAG_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))\s*\(?\s*(Dr|Cr)\s*\)?', re.IGNORECASE)
+    AMOUNT_PLAIN_RE = re.compile(r'(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))')
+
+    def parse_record(rec: str) -> Optional[Dict[str, str]]:
+        m = DATE_LINE_RE.match(rec)
+        if not m:
+            return None
+        date = m.group(1).strip()
+        rest = rec[m.end():].strip()
+        
+        amount_tags = AMOUNT_TAG_RE.findall(rest)
+        if not amount_tags:
+            plain_amounts = AMOUNT_PLAIN_RE.findall(rest)
+            if len(plain_amounts) >= 2:
+                txn_amt = plain_amounts[-2].replace(' ', '').replace(',', '')
+                bal_amt = plain_amounts[-1].replace(' ', '').replace(',', '')
+                narration = AMOUNT_PLAIN_RE.sub('', rest).strip()
+                narration = narration.strip(' ,;-')
+                return {"Date": date, "Narration": narration, "Debit": txn_amt, "Credit": "", "Balance": bal_amt}
+            else:
+                narration = rest
+                return {"Date": date, "Narration": narration, "Debit": "", "Credit": "", "Balance": ""}
+        
+        normalized = [(a.replace(' ', '').replace(',', ''), t.lower()) for a, t in amount_tags]
+        txn_amt, txn_tag = normalized[0]
+        if len(normalized) >= 2:
+            bal_amt, bal_tag = normalized[-1]
+        else:
+            bal_amt = ""
+        debit = txn_amt if txn_tag == 'dr' else ""
+        credit = txn_amt if txn_tag == 'cr' else ""
+        
+        narration = AMOUNT_TAG_RE.sub('', rest).strip()
+        narration = narration.strip(' ,;-')
+        
+        return {"Date": date, "Narration": narration, "Debit": debit, "Credit": credit, "Balance": bal_amt}
+
+    def parse_records(records: List[str]) -> pd.DataFrame:
+        parsed = []
+        for r in records:
+            p = parse_record(r)
+            if p:
+                parsed.append(p)
+        df = pd.DataFrame(parsed, columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+        df = df.fillna("").astype(str)
+        return df
 
 # ---------- Main flow ----------
 # Attempt text extraction
