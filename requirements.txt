@@ -9,3 +9,4 @@ opencv-python
 chardet
 PyPDF2
 tabula-py
+pytest
