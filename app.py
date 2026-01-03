@@ -4,9 +4,12 @@ Bank-specific parsers with Bank of Baroda support.
 """
 import io
 import re
-from typing import Dict, List, Optional
+import tempfile
+from pathlib import Path
+from typing import List, Dict, Optional
 
 import pandas as pd
+import tabula
 import pdfplumber
 import pytesseract
 import streamlit as st
@@ -177,6 +180,47 @@ def parse_records(records: List[str]) -> pd.DataFrame:
     df = df.fillna("").astype(str)
     return df
 
+# ---------- Tabula extraction ----------
+def extract_tabula_tables(pdf_bytes: bytes) -> List[pd.DataFrame]:
+    """Extract tables from PDF using tabula and return list of DataFrames."""
+    tables: List[pd.DataFrame] = []
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = Path(tmp.name)
+        try:
+            tables = tabula.read_pdf(str(tmp_path), pages="all", multiple_tables=True, lattice=True)
+        finally:
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return tables or []
+
+
+def tabula_tables_to_lines(tables: List[pd.DataFrame]) -> List[str]:
+    lines: List[str] = []
+    for tbl in tables:
+        try:
+            df = tbl.fillna("")
+            for _, row in df.iterrows():
+                row_values = [str(v).strip() for v in row.tolist() if str(v).strip()]
+                if row_values:
+                    lines.append(" ".join(row_values))
+        except Exception:
+            continue
+    return lines
+
+
+# ---------- Main flow ----------
+# Attempt table-based text extraction first
+lines = tabula_tables_to_lines(extract_tabula_tables(pdf_bytes))
+
+# Fallback to text extraction if tabula yields little content
+if len(lines) < 5:
+    lines = text_from_pdf_bytes(pdf_bytes)
 
 # ---------- Bank of Baroda table parser ----------
 def _clean_amount(val: Optional[str]) -> str:
