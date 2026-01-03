@@ -59,6 +59,17 @@ AMOUNT_PLAIN_RE = re.compile(r"(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2}))")
 CHEQUE_REF_RE = re.compile(r"\b(IMPS|UPI|TBMS|NEFT|RTGS|Chq|Cheque|Ref|Reference)[-/]?[A-Za-z0-9]+\b", re.IGNORECASE)
 
 
+def _clean_amount(val: Optional[str]) -> str:
+    """Normalize amount strings for debit/credit/balance columns."""
+    if not val:
+        return ""
+    cleaned = str(val).replace(",", "").replace(" ", "").replace("₹", "").strip()
+    # Handle brackets as negative
+    if cleaned.startswith("(") and cleaned.endswith(")"):
+        cleaned = "-" + cleaned[1:-1]
+    return cleaned
+
+
 # ---------- extraction helpers ----------
 def text_from_pdf_bytes(pdf_bytes: bytes) -> List[str]:
     lines: List[str] = []
@@ -189,7 +200,9 @@ def extract_tabula_tables(pdf_bytes: bytes) -> List[pd.DataFrame]:
             tmp.write(pdf_bytes)
             tmp_path = Path(tmp.name)
         try:
-            tables = tabula.read_pdf(str(tmp_path), pages="all", multiple_tables=True, lattice=True)
+            tables = tabula.read_pdf(
+                str(tmp_path), pages="all", multiple_tables=True, lattice=True
+            )
         finally:
             try:
                 tmp_path.unlink()
@@ -214,25 +227,90 @@ def tabula_tables_to_lines(tables: List[pd.DataFrame]) -> List[str]:
     return lines
 
 
-# ---------- Main flow ----------
-# Attempt table-based text extraction first
-lines = tabula_tables_to_lines(extract_tabula_tables(pdf_bytes))
+def parse_tabula_structured(tables: List[pd.DataFrame]) -> pd.DataFrame:
+    """Attempt to build a structured dataframe directly from tabula tables."""
 
-# Fallback to text extraction if tabula yields little content
-if len(lines) < 5:
-    lines = text_from_pdf_bytes(pdf_bytes)
+    def find_idx(header: List[str], options: List[str]) -> Optional[int]:
+        for i, col in enumerate(header):
+            for opt in options:
+                if opt in col:
+                    return i
+        return None
+
+    rows: List[Dict[str, str]] = []
+
+    for tbl in tables:
+        try:
+            df = tbl.fillna("")
+        except Exception:
+            continue
+        if df.empty:
+            continue
+
+        # Try both column names and first row as header hints
+        header_candidates: List[List[str]] = [
+            [str(c or "").strip().lower() for c in df.columns]
+        ]
+        first_row = [str(v).strip().lower() for v in df.iloc[0].tolist()]
+        header_candidates.append(first_row)
+
+        data_rows = df
+        for header in header_candidates:
+            date_idx = find_idx(header, ["date"])
+            narration_idx = find_idx(header, ["narration", "particulars", "description"])
+            debit_idx = find_idx(header, ["debit", "withdrawal"])
+            credit_idx = find_idx(header, ["credit", "deposit"])
+            balance_idx = find_idx(header, ["balance", "bal", "running bal", "closing bal"])
+            ref_idx = find_idx(header, ["ref", "chq", "cheque", "utr", "utr no", "ch no", "chq no"])
+
+            if date_idx is None or narration_idx is None:
+                continue
+
+            # If the header came from the first row, skip that row when reading data
+            start_index = 1 if header is first_row else 0
+            for _, row in data_rows.iloc[start_index:].iterrows():
+                cells = row.tolist()
+                if max(date_idx, narration_idx) >= len(cells):
+                    continue
+                date = (cells[date_idx] or "").strip()
+                narration = (cells[narration_idx] or "").strip()
+                debit = _clean_amount(cells[debit_idx]) if debit_idx is not None and debit_idx < len(cells) else ""
+                credit = _clean_amount(cells[credit_idx]) if credit_idx is not None and credit_idx < len(cells) else ""
+                balance = _clean_amount(cells[balance_idx]) if balance_idx is not None and balance_idx < len(cells) else ""
+                ref_val = (cells[ref_idx] or "").strip() if ref_idx is not None and ref_idx < len(cells) else ""
+
+                if date.lower() == "date":
+                    continue
+
+                full_narration = narration
+                if ref_val:
+                    full_narration = (
+                        f"{narration} (Ref: {ref_val})" if narration else f"Ref: {ref_val}"
+                    )
+
+                if any([date, full_narration, debit, credit, balance]):
+                    rows.append(
+                        {
+                            "Date": date,
+                            "Narration": full_narration,
+                            "Debit": debit,
+                            "Credit": credit,
+                            "Balance": balance,
+                        }
+                    )
+
+            # break candidate loop if we successfully mapped columns
+            if rows:
+                break
+
+    if rows:
+        df_rows = pd.DataFrame(rows, columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+        return df_rows.fillna("").astype(str)
+
+    return pd.DataFrame(columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+
 
 # ---------- Bank of Baroda table parser ----------
-def _clean_amount(val: Optional[str]) -> str:
-    if not val:
-        return ""
-    cleaned = str(val).replace(",", "").replace(" ", "").replace("₹", "").strip()
-    # Handle brackets as negative
-    if cleaned.startswith("(") and cleaned.endswith(")"):
-        cleaned = "-" + cleaned[1:-1]
-    return cleaned
-
-
 def parse_bank_of_baroda(pdf_bytes: bytes) -> pd.DataFrame:
     rows: List[Dict[str, str]] = []
     try:
@@ -307,11 +385,22 @@ def parse_bank_of_baroda(pdf_bytes: bytes) -> pd.DataFrame:
 
 # ---------- Parser dispatcher ----------
 def parse_pdf_by_bank(bank: str, pdf_bytes: bytes) -> pd.DataFrame:
-    if bank == "Bank of Baroda":
-        return parse_bank_of_baroda(pdf_bytes)
+    tables = extract_tabula_tables(pdf_bytes)
 
-    # Kotak Mahindra Bank retains the line-based parser used earlier
-    lines = text_from_pdf_bytes(pdf_bytes)
+    # Prefer structured tabula output whenever columns are detected
+    structured_df = parse_tabula_structured(tables)
+    if not structured_df.empty:
+        return structured_df
+
+    if bank == "Bank of Baroda":
+        bob_df = parse_bank_of_baroda(pdf_bytes)
+        if not bob_df.empty:
+            return bob_df
+
+    # Generic fallback: use tabula lines, then text, then OCR
+    lines = tabula_tables_to_lines(tables)
+    if len(lines) < 5:
+        lines = text_from_pdf_bytes(pdf_bytes)
     if len(lines) < 8:
         lines = ocr_pdf_bytes(pdf_bytes, dpi=350, max_pages=None)
     records = group_lines_into_records(lines)
