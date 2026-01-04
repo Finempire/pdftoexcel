@@ -16,6 +16,8 @@ import streamlit as st
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
+from bob_parser import BOBStatementParser
+
 
 st.set_page_config(page_title="Bank PDF → Excel", layout="wide")
 st.title("Bank Statement Converter")
@@ -311,6 +313,24 @@ def parse_tabula_structured(tables: List[pd.DataFrame]) -> pd.DataFrame:
 
 
 # ---------- Bank of Baroda table parser ----------
+def parse_bank_of_baroda_advanced(pdf_bytes: bytes) -> pd.DataFrame:
+    """Parse Bank of Baroda statements using the dedicated parser."""
+    try:
+        parser = BOBStatementParser(pdf_bytes)
+        result = parser.parse()
+    except Exception:
+        return pd.DataFrame(columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+
+    df = result.get("transactions_df", pd.DataFrame())
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+
+    df = df.rename(columns={"Description": "Narration"})
+    df = df[["Date", "Narration", "Debit", "Credit", "Balance"]]
+    df = df.fillna("").astype(str)
+    return df
+
+
 def parse_bank_of_baroda(pdf_bytes: bytes) -> pd.DataFrame:
     rows: List[Dict[str, str]] = []
     try:
@@ -393,6 +413,10 @@ def parse_pdf_by_bank(bank: str, pdf_bytes: bytes) -> pd.DataFrame:
         return structured_df
 
     if bank == "Bank of Baroda":
+        advanced_bob_df = parse_bank_of_baroda_advanced(pdf_bytes)
+        if not advanced_bob_df.empty:
+            return advanced_bob_df
+
         bob_df = parse_bank_of_baroda(pdf_bytes)
         if not bob_df.empty:
             return bob_df
