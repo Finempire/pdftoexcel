@@ -9,10 +9,8 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-from bank_parser import BankStatementParser
+from bob_parser import BOBStatementParser
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Bank PDF → Excel", layout="wide")
 st.title("Bank Statement Converter")
@@ -60,9 +58,130 @@ if use_ocr:
 with st.spinner("Parsing statement..."):
     result = parser.parse(pdf_bytes)
 
-if not parser.validate_data(result):
-    st.error("Could not validate parsed data. Please try a different PDF or bank selection.")
-    st.stop()
+            if date_idx is None or narration_idx is None:
+                continue
+
+            # If the header came from the first row, skip that row when reading data
+            start_index = 1 if header is first_row else 0
+            for _, row in data_rows.iloc[start_index:].iterrows():
+                cells = row.tolist()
+                if max(date_idx, narration_idx) >= len(cells):
+                    continue
+                date = (cells[date_idx] or "").strip()
+                narration = (cells[narration_idx] or "").strip()
+                debit = _clean_amount(cells[debit_idx]) if debit_idx is not None and debit_idx < len(cells) else ""
+                credit = _clean_amount(cells[credit_idx]) if credit_idx is not None and credit_idx < len(cells) else ""
+                balance = _clean_amount(cells[balance_idx]) if balance_idx is not None and balance_idx < len(cells) else ""
+                ref_val = (cells[ref_idx] or "").strip() if ref_idx is not None and ref_idx < len(cells) else ""
+
+                if date.lower() == "date":
+                    continue
+
+                full_narration = narration
+                if ref_val:
+                    full_narration = (
+                        f"{narration} (Ref: {ref_val})" if narration else f"Ref: {ref_val}"
+                    )
+
+                if any([date, full_narration, debit, credit, balance]):
+                    rows.append(
+                        {
+                            "Date": date,
+                            "Narration": full_narration,
+                            "Debit": debit,
+                            "Credit": credit,
+                            "Balance": balance,
+                        }
+                    )
+
+            # break candidate loop if we successfully mapped columns
+            if rows:
+                break
+
+    if rows:
+        df_rows = pd.DataFrame(rows, columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+        return df_rows.fillna("").astype(str)
+
+    return pd.DataFrame(columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+
+
+# ---------- Bank of Baroda table parser ----------
+def parse_bank_of_baroda_advanced(pdf_bytes: bytes) -> pd.DataFrame:
+    """Parse Bank of Baroda statements using the dedicated parser."""
+    try:
+        parser = BOBStatementParser(pdf_bytes)
+        result = parser.parse()
+    except Exception:
+        return pd.DataFrame(columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+
+    df = result.get("transactions_df", pd.DataFrame())
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Date", "Narration", "Debit", "Credit", "Balance"])
+
+    df = df.rename(columns={"Description": "Narration"})
+    df = df[["Date", "Narration", "Debit", "Credit", "Balance"]]
+    df = df.fillna("").astype(str)
+    return df
+
+
+def parse_bank_of_baroda(pdf_bytes: bytes) -> pd.DataFrame:
+    rows: List[Dict[str, str]] = []
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+                    header = [(cell or "").strip().lower() for cell in table[0]]
+
+                    def find_idx(options: List[str]) -> Optional[int]:
+                        for i, col in enumerate(header):
+                            for opt in options:
+                                if opt in col:
+                                    return i
+                        return None
+
+                    date_idx = find_idx(["date"])
+                    narration_idx = find_idx(["narration", "particulars", "description"])
+                    chq_idx = find_idx(["chq", "cheque", "ch no", "chq no", "chq no."])
+                    debit_idx = find_idx(["debit", "withdrawal"])
+                    credit_idx = find_idx(["credit", "deposit"])
+                    balance_idx = find_idx(["balance", "bal"])
+
+                    if date_idx is None or narration_idx is None:
+                        continue
+
+                    for row in table[1:]:
+                        if not row or max(date_idx, narration_idx) >= len(row):
+                            continue
+                        date = (row[date_idx] or "").strip()
+                        narration = (row[narration_idx] or "").strip()
+                        chq_val = (row[chq_idx] or "").strip() if chq_idx is not None and chq_idx < len(row) else ""
+                        debit = _clean_amount(row[debit_idx]) if debit_idx is not None and debit_idx < len(row) else ""
+                        credit = _clean_amount(row[credit_idx]) if credit_idx is not None and credit_idx < len(row) else ""
+                        balance = _clean_amount(row[balance_idx]) if balance_idx is not None and balance_idx < len(row) else ""
+
+                        # Skip header-like repeats
+                        if date.lower() == "date":
+                            continue
+
+                        full_narration = narration
+                        if chq_val:
+                            full_narration = f"{narration} (Chq/Ref: {chq_val})" if narration else f"Chq/Ref: {chq_val}"
+
+                        if any([date, full_narration, debit, credit, balance]):
+                            rows.append(
+                                {
+                                    "Date": date,
+                                    "Narration": full_narration,
+                                    "Debit": debit,
+                                    "Credit": credit,
+                                    "Balance": balance,
+                                }
+                            )
+    except Exception:
+        rows = []
 
 st.success(f"Parsed {len(result.transactions)} transactions for bank: {result.metadata.get('bank_name', 'unknown')}")
 st.caption(f"Extraction confidence: {result.confidence * 100:.0f}%")
@@ -89,6 +208,14 @@ def to_excel_bytes(dff: pd.DataFrame) -> bytes:
         dff.to_excel(writer, index=False, sheet_name="Statement")
     return out.getvalue()
 
+    if bank == "Bank of Baroda":
+        advanced_bob_df = parse_bank_of_baroda_advanced(pdf_bytes)
+        if not advanced_bob_df.empty:
+            return advanced_bob_df
+
+        bob_df = parse_bank_of_baroda(pdf_bytes)
+        if not bob_df.empty:
+            return bob_df
 
 def to_json_bytes(dff: pd.DataFrame) -> bytes:
     return dff.to_json(orient="records", force_ascii=False).encode("utf-8")
